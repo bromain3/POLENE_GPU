@@ -3,6 +3,7 @@ from POLENE_GPU.NN.trainer._statsSave import _statsSave
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+import gc
 
 class baseTrainer(_statsSave):
     def __init__(self, testSize=0.25, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
@@ -87,6 +88,9 @@ class baseTrainer(_statsSave):
 
 
     def train(self, X, Y, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
         X, Xval, Y, Yval = self.trainTestSplit(X, Y)
         #  data is already shuffled.
 

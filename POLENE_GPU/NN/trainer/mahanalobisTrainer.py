@@ -3,6 +3,7 @@ from POLENE_GPU.NN.trainer._statsSave import _statsSave
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+import gc
 
 class mahanalobisTrainerGradNorm(_statsSave):
     """
@@ -468,8 +469,8 @@ class mahanalobisTrainer(_statsSave):
     loss de mahanalobis avec M = (1-lambda) I + lambda J qui permet d'ajuster la compression / decompression des distances
     The prefactor 1.08e-7 commes from the gradnorm trainer. this value ensures the pure mahanalobis loss learns as fast as the pure MSE with no prefactor
     """
-    def __init__(self, testSize=0.25, lamb=10, mahaPrefactor=3.286e-4, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
-        print("There seems to be an issue with very high lambda (huge loss) while it should be a pure mse loss that is known for working well")
+    def __init__(self, testSize=0.25, lamb=1, mahaPrefactor=3.286e-4, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
+        print("There seems to be an issue with lambda very close to 1 (huge loss compared to what it should be) while it should be a pure mse loss that is known for working well")
         _statsSave.__init__(self)
         self.testSize = testSize
         self.lr = lr
@@ -483,7 +484,7 @@ class mahanalobisTrainer(_statsSave):
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
 
-        self.lamb = 10 ** (-lamb)
+        self.lamb = lamb
         self.mahaPrefactor = mahaPrefactor
 
     def warmup_exp_decay(self, k):
@@ -517,7 +518,7 @@ class mahanalobisTrainer(_statsSave):
         diff = preds - targets  # (B, d)
         diff = diff.unsqueeze(-1)  # (B, d, 1)
         I = torch.eye(diff.shape[1], device=self.trainingDevice, dtype=self.trainingDtype).unsqueeze(0)
-        J_diff = torch.bmm((1 - self.lamb) * I + self.lamb * self.mahaPrefactor * J, diff)  # (B, d, 1)
+        J_diff = torch.bmm((self.lamb) * I + (1 - self.lamb) * self.mahaPrefactor * J, diff)  # (B, d, 1)
         loss = (J_diff ** 2).sum(dim=(1, 2))  # (B,)
 
         return loss.mean()
@@ -571,6 +572,9 @@ class mahanalobisTrainer(_statsSave):
 
 
     def train(self, X, Y, JSystem_Y, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
         X, Xval, Y, Yval, JSystem_Y, JSystemVal_Y = self.trainTestSplit(X, Y, JSystem_Y)
         #  data is already shuffled.
 
@@ -590,9 +594,11 @@ class mahanalobisTrainer(_statsSave):
                   f"Val: {self._format_loss(validationLoss)}  |  "
                   f"LR: {current_lr:.2e}")
 
-#TODO: essayer de passer par le calcul torch de la jvp pour accélérer le calcul en diminuant le temps de transfert cpu gpu de la matrice
 # TODO: essayer de changer la loss ||ypred-y||^2 + lambda ||J(ypred-y)||^2 en prefactor_for_scaling(function of lambda) * ||(lambda I + (1-lambda)J)(ypred-y)||^2.
 #  avec lambda qui serait une fonction du nombre de conditionement moyen de la base de données. un objectif de +- court terme pourait être de montrer que le lambda optimal est corrélé au nombre de conditionement
 #  en faisant une optimisation bayesienne qui porte uniquement sur lambda (coef exponetiel). on peut tracer alors val loss optimal de chaque base de donnée et son nombre moyen de conditionement (moyenne des log(conditionement))
 #  Il doit bien y avoir un lien entre les deux quantités log.
-# enfin, essayer d'optimiser lambda dans prefactor_for_scaling(function of lambda) * ||(lambda I + (1-lambda)J)(ypred-y)||^2. tel que ça minimise la loss MSE sur les données (ou celle de val). ça resemblerai à une sorte de gradnorm
+#  essayer d'optimiser lambda dans prefactor_for_scaling(function of lambda) * ||(lambda I + (1-lambda)J)(ypred-y)||^2. tel que ça minimise la loss MSE sur les données (ou celle de val). ça resemblerai à une sorte de gradnorm
+#  Si c'est trop dur, on peut aussi faire un annealing pour optimiser full mahanalobis au début et full MSE à la fin (mahanalobis s'optimise toujours assez facilement et permet de capter les zones raides. on vient ensuite capter les zones lentes avec mse.)
+
+# TODO: étudier les différentes façons de scaler M(lambda) (soit normalisation élément par élément par la norme soit normalisation par la moyenne de la norme par batch, ça dépend si on veu conserver l'information de la rigidité absolue par rapport aux autre échatillons de la loss.
