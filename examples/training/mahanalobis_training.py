@@ -4,7 +4,7 @@ from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
 from POLENE_GPU.NN.models.resNet import ResNet
 from POLENE_GPU.NN.trainer.baseTrainer import baseTrainer
-from POLENE_GPU.NN.trainer.mahanalobisTrainer import mahanalobisTrainer, jacobianMahanalobisTrainer
+from POLENE_GPU.NN.trainer.mahanalobisTrainer import mahanalobisTrainer, jacobianMahanalobisTrainer, mahanalobisTrainerGradNorm
 from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
 from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
 from POLENE_GPU.NN.validator.jacobianValidation import jacobianValidation
@@ -13,7 +13,7 @@ from POLENE_GPU.misc.batchFunction import batched_apply
 from POLENE_GPU.dataHandler.serie import serie
 import POLENE_GPU.databaseGeneration.standalone.NeuralCFD as NeuNeu
 
-import kineticsGPU.torch.reactors.constantP as cstPreactorTorch
+import kineticsGPU.torch.reactors.constantV as cstVreactorTorch
 import kineticsGPU.cuda.kernels.per_thread.reactor_odes as reactors
 
 import torch
@@ -24,14 +24,14 @@ savingDdtype = torch.float64
 CPUparallelProcessing = 30  # False or number of processor used
 n_init_cond = 1000
 
-trainingDevice = torch.device('cuda:0')
+trainingDevice = torch.device('cuda:1')
 trainingDdtype = torch.float32
 
-validationDevice = torch.device('cuda:0')
+validationDevice = torch.device('cuda:1')
 validationDdtype = torch.float32
 
 JVPDtype = torch.float64
-JVPDevice = torch.device('cuda:0')
+JVPDevice = torch.device('cuda:1')
 
 mech = 'gri30.yaml'
 dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100.h5'
@@ -43,7 +43,6 @@ with Timer("Model creation"):
     reactormodel = cantera0D.cstV(
         kinetics=mech,
         cstSamplingdt=False,
-        equilibriumTolerance=0
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -51,6 +50,12 @@ with Timer("DatabaseGenerator creation"):
 
 with Timer("Single trajectory"):
     X, Y, tX, tY = dtbgen.generateSingleTrajectory({'T': 1700, 'P': 101325, 'phi': 1.0})
+
+#with Timer("Initial conditions sampling"):
+#    intiCond = dtbgen.generateInitialConditionSamples('Halton', n_init_cond)
+
+#with Timer("Dataset generation"):
+#    Xdtb, Ydtb = dtbgen.generateDataset(intiCond, CPUparallelProcessing=CPUparallelProcessing)
 
 with Timer("Dataset generation"):
     Xdtb, Ydtb = NeuNeu.readH5Database(dtb_path, mech)
@@ -74,7 +79,7 @@ if not classicTraining:
         jacobianComp = reactors.CUDAFullJacobianConstantVTPY_PT(mech, torchComputationDtype=JVPDtype, dataDevice=savingDevice, computationDevice=JVPDevice, storageDtype=savingDdtype)
 
     with Timer("Computing per thread jacobian"):
-        J_chem_Y = batched_apply(jacobianComp.evaluate, Ydtb.data[:, 0].flatten(), Ydtb.data[:, 1].flatten(), Ydtb.data[:, 2:], batch_size=20_000, device=JVPDevice, dtype=JVPDtype)
+        J_chem_Y = batched_apply(jacobianComp.evaluate, Ydtb.data[:, 0].flatten(), Ydtb.data[:, 1].flatten(), Ydtb.data[:, 2:], batch_size=15_000, device=JVPDevice, dtype=JVPDtype)
         J_chem_Y = serie(J_chem_Y, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
 
         #TODO: faire passer ces opérations sur GPU en batch apply (on pourrait aussi tout faire en torch32, à voir si ça modifie beacoup la precision):
@@ -86,25 +91,16 @@ if not classicTraining:
         J_transfo_Y = serie(J_transfo_Y_data, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
         del J_chem_Y
         J_transfo_Y_scaled = model.outputScaler.J(Ydtb).unsqueeze(2) * J_transfo_Y.data * model.inputScaler.J_1(Ydtb_scaled).unsqueeze(1)  #TODO: verifier ce calcul. si pas sur, transformer tout en matrices diagonales, tant pis pour le temps de calcul
-        #TODO: vérifier les points d'application du scaling. la matrice étant calculée en Y, il faudrait probablement calculer J_1 en Yscaled
-
-        #TODO: verifier si ce scaling permet de mieux répartir la loss (sinon les zones très rigides sont ultre sur representées et la fin de combustion est ultra mal aprise (on dirait que non
-        #scale = J_transfo_Y_scaled.norm(dim=(-2, -1), keepdim=True).mean().detach()
-        #J_transfo_Y_scaled = J_transfo_Y_scaled / scale
 
         J_transfo_Y_scaled = serie(J_transfo_Y_scaled, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
         del J_transfo_Y
-        # TODO: work on mahanalobis matrix scaling
-        #norm = J_transfo_Y_scaled.data.norm(dim=(1, 2), keepdim=True) + 1e-6
-        #J_scaled = J_transfo_Y_scaled.data / norm
-        #J_scaled = serie(J_scaled, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
 
-    #with Timer("Torch derivative computation intitialisation"):
-    #    reactorTorch = cstPreactorTorch.constantPReactorTPY(mech, JVPDevice, JVPDtype)
+
 
 with Timer("Trainer initialisation"):
     if not classicTraining:
-        trainer = mahanalobisTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, lamb=0.9999)
+        trainer = mahanalobisTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, lamb=3)
+        #trainer = mahanalobisTrainerGradNorm(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)
     else:
         trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)
 
@@ -137,7 +133,7 @@ with Timer("Model validaton"):
 
 with Timer("Validator initialisation"):
     validator = jacobianValidation(validationDtype=validationDdtype, validationDevice=validationDevice)
-    reactorTorch = cstPreactorTorch.constantPReactorTPY(mech, JVPDevice, JVPDtype)
+    reactorTorch = cstVreactorTorch.constantVReactorTPY(mech, JVPDevice, JVPDtype)
 
 with Timer("Model validaton"):
     validator.validate(model, X, Y, tX, reactorTorch, reactormodel.dtcfd)

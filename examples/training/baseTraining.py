@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 savingDevice = torch.device('cpu')
 savingDdtype = torch.float64
 CPUparallelProcessing = 30  # False or number of processor used
-n_init_cond = 1000
+n_init_cond = 100
 
 trainingDevice = torch.device('cuda:0')
 trainingDdtype = torch.float32
@@ -31,10 +31,9 @@ JVPDevice = torch.device('cuda:0')
 mech = 'gri30.yaml'
 
 with Timer("Model creation"):
-    reactormodel = cantera0D.cstV(
+    reactormodel = cantera0D.cstP(
         kinetics=mech,
         cstSamplingdt=False,
-        equilibriumTolerance=0
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -60,7 +59,7 @@ with Timer("Database scaling"):
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, lr=1e-3)
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=300)
 
 with Timer("Model training"):
     trainer.train(Xdtb_scaled, Ydtb_scaled, model)

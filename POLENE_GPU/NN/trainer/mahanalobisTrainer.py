@@ -469,8 +469,7 @@ class mahanalobisTrainer(_statsSave):
     loss de mahanalobis avec M = (1-lambda) I + lambda J qui permet d'ajuster la compression / decompression des distances
     The prefactor 1.08e-7 commes from the gradnorm trainer. this value ensures the pure mahanalobis loss learns as fast as the pure MSE with no prefactor
     """
-    def __init__(self, testSize=0.25, lamb=1, mahaPrefactor=3.286e-4, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
-        print("There seems to be an issue with lambda very close to 1 (huge loss compared to what it should be) while it should be a pure mse loss that is known for working well")
+    def __init__(self, testSize=0.25, lamb=5, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
         _statsSave.__init__(self)
         self.testSize = testSize
         self.lr = lr
@@ -484,8 +483,7 @@ class mahanalobisTrainer(_statsSave):
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
 
-        self.lamb = lamb
-        self.mahaPrefactor = mahaPrefactor
+        self.lamb = 10 ** (-lamb)
 
     def warmup_exp_decay(self, k):
         if self.warmupSteps > 0 and k < self.warmupSteps:
@@ -517,10 +515,16 @@ class mahanalobisTrainer(_statsSave):
     def mahalanobis_loss(self, preds, targets, J):
         diff = preds - targets  # (B, d)
         diff = diff.unsqueeze(-1)  # (B, d, 1)
+        # Construction de la matrice M
         I = torch.eye(diff.shape[1], device=self.trainingDevice, dtype=self.trainingDtype).unsqueeze(0)
-        J_diff = torch.bmm((self.lamb) * I + (1 - self.lamb) * self.mahaPrefactor * J, diff)  # (B, d, 1)
-        loss = (J_diff ** 2).sum(dim=(1, 2))  # (B,)
+        M = (1 - self.lamb) * I + self.lamb * J  # (B, d, d)
 
+        #norms = torch.linalg.norm(M, ord='fro', dim=(1, 2))  # Shape: (B,)
+        #norms = norms.unsqueeze(-1).unsqueeze(-1)
+        #M_scaled = diff.shape[1] ** (1/2) * M / norms
+
+        J_diff = torch.bmm(M, diff)  # (B, d, 1)
+        loss = (J_diff ** 2).mean(dim=(1, 2))  # (B,)
         return loss.mean()
 
     def __trainingPhase(self, X, Y, J_Y, model, optimizer, lrScheduler, lossFunc):
