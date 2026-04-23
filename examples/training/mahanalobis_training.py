@@ -3,6 +3,7 @@ import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
 from POLENE_GPU.NN.models.resNet import ResNet
+from POLENE_GPU.databaseGeneration.standalone.oversampler import generateIntermediateSamples
 from POLENE_GPU.NN.trainer.baseTrainer import baseTrainer
 from POLENE_GPU.NN.trainer.mahanalobisTrainer import mahanalobisTrainer, jacobianMahanalobisTrainer, mahanalobisTrainerGradNorm
 from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
@@ -12,6 +13,8 @@ from POLENE_GPU.misc.timer import Timer
 from POLENE_GPU.misc.batchFunction import batched_apply
 from POLENE_GPU.dataHandler.serie import serie
 import POLENE_GPU.databaseGeneration.standalone.NeuralCFD as NeuNeu
+from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ_1
+
 
 import kineticsGPU.torch.reactors.constantV as cstVreactorTorch
 import kineticsGPU.cuda.kernels.per_thread.reactor_odes as reactors
@@ -34,15 +37,16 @@ JVPDtype = torch.float64
 JVPDevice = torch.device('cuda:1')
 
 mech = 'gri30.yaml'
-dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100.h5'
-undersamplingProp = 0.3
-classicTraining = False  #  ~ 1.731e-5 en val avec training classique (test == val étonnement)
-
+dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100_1500_cells.h5'
+undersamplingProp = 0.3  # TODO: study the impact of oversampling before or after the uniform undersampling. I think the cleanest would be to oversample and then undersample
+classicTraining = True  #  ~ 1.731e-5 en val avec training classique (test == val étonnement)
+dtcfd = 1e-7
 
 with Timer("Model creation"):
     reactormodel = cantera0D.cstV(
         kinetics=mech,
         cstSamplingdt=False,
+        dtcfd=dtcfd,
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -64,38 +68,31 @@ with Timer("Dataset generation"):
     Xdtb = Xdtb[indices]
     Ydtb = Ydtb[indices]
 
+with Timer("Oversampling"):
+    X_more, Y_more = generateIntermediateSamples(Xdtb, dtcfd, "cstV", mech, CPUparallelProcessing, chunksize=1500)
+    # TODO: il faudrait soint concat X_more et Y_more à Xdtb et Ydtb soit que X_more et Y_more incorporent directement X_dtb et Y_dtb mais pour l'instant on laisse tomber
+    n = int(X_more.nSamples * undersamplingProp)
+    indices = torch.randperm(X_more.nSamples)[:n]
+    X_more = X_more[indices]
+    Y_more = Y_more[indices]
+
 with Timer("Model creation"):
-    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True)
+    model = ResNet(X_more.nFeatures, 54, 2, 350, layerNorm=True)
 
 with Timer("Database scaling"):
     scaler = stdScaler()
-    Xdtb_scaled = scaler.fit_transform(Xdtb)
-    Ydtb_scaled = scaler.transform(Ydtb)
+    Xdtb_scaled = scaler.fit_transform(X_more)
+    Ydtb_scaled = scaler.transform(Y_more)
     model.inputScaler = scaler
     model.outputScaler = scaler
 
 if not classicTraining:
-    with Timer("Jacobian computator initialisation"):
-        jacobianComp = reactors.CUDAFullJacobianConstantVTPY_PT(mech, torchComputationDtype=JVPDtype, dataDevice=savingDevice, computationDevice=JVPDevice, storageDtype=savingDdtype)
-
     with Timer("Computing per thread jacobian"):
-        J_chem_Y = batched_apply(jacobianComp.evaluate, Ydtb.data[:, 0].flatten(), Ydtb.data[:, 1].flatten(), Ydtb.data[:, 2:], batch_size=15_000, device=JVPDevice, dtype=JVPDtype)
-        J_chem_Y = serie(J_chem_Y, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
-
-        #TODO: faire passer ces opérations sur GPU en batch apply (on pourrait aussi tout faire en torch32, à voir si ça modifie beacoup la precision):
-        #On calcule -dt * J_chem
-        J_transfo_Y_data = - reactormodel.dtcfd * J_chem_Y.data
-        # On ajoute 1 sur la diagonale de chaque matrice du batch (Broadcasting efficace) plutot que de calculer/stocker une grande quantité de matrices identité
-        n = Xdtb.nFeatures
-        J_transfo_Y_data[:, range(n), range(n)] += 1
-        J_transfo_Y = serie(J_transfo_Y_data, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
-        del J_chem_Y
-        J_transfo_Y_scaled = model.outputScaler.J(Ydtb).unsqueeze(2) * J_transfo_Y.data * model.inputScaler.J_1(Ydtb_scaled).unsqueeze(1)  #TODO: verifier ce calcul. si pas sur, transformer tout en matrices diagonales, tant pis pour le temps de calcul
-
-        J_transfo_Y_scaled = serie(J_transfo_Y_scaled, ['J'], storingDevice=savingDevice, storingDtype=savingDdtype)
-        del J_transfo_Y
-
-
+        J_Y_scaled = getScaledTransformationJ_1("cstV", mech, Xdtb_scaled, Ydtb_scaled, model.inputScaler, model.outputScaler,
+                                                reactormodel.dtcfd, computationArchitechture='pt', batch_size=15_000,
+                                                computationDevice=JVPDevice, storingDevice=savingDevice,
+                                                storingDtype=savingDdtype)
+        print(J_Y_scaled.data.max())
 
 with Timer("Trainer initialisation"):
     if not classicTraining:
@@ -106,7 +103,7 @@ with Timer("Trainer initialisation"):
 
 with Timer("Model training"):
     if not classicTraining:
-        trainer.train(Xdtb_scaled, Ydtb_scaled, J_transfo_Y_scaled, model)
+        trainer.train(Xdtb_scaled, Ydtb_scaled, J_Y_scaled, model)
     else:
         trainer.train(Xdtb_scaled, Ydtb_scaled, model)
 

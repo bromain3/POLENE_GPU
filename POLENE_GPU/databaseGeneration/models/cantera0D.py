@@ -39,8 +39,8 @@ class __canteraReactorGenerator:
 
         featuresReactor = reactorType(gas)
         featuresNet = ct.ReactorNet([featuresReactor])
-        if self.cstSamplingdt:
-            featuresNet.max_time_step = self.dtcfd
+        if not self.cstSamplingdt:
+            featuresNet.max_time_step = self.dtcfd #TODO: activating and deactivating it to show the difference in post combustion part of the trajcetory
 
         X = []
         Y = []

@@ -74,6 +74,7 @@ class baseTrainer(_statsSave):
 
         with torch.no_grad():
             for batch in range(0, Xval.nSamples, self.batchSize):
+                #TODO: non_blocking=True sur transfert GPU
                 batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
                 batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 

@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 savingDevice = torch.device('cpu')
 savingDdtype = torch.float64
 CPUparallelProcessing = 30  # False or number of processor used
-n_init_cond = 100
+n_init_cond = 1000
 
 trainingDevice = torch.device('cuda:0')
 trainingDdtype = torch.float32
@@ -59,7 +59,7 @@ with Timer("Database scaling"):
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=300)
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)
 
 with Timer("Model training"):
     trainer.train(Xdtb_scaled, Ydtb_scaled, model)

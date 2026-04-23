@@ -43,3 +43,20 @@ def getScaledTransformationJ_1(reactorType, mech, X, Y, inputScaler, outputScale
 
     J_scaled = J_in.unsqueeze(2) * J_phys.data * J_1_out.unsqueeze(1)
     return serie(J_scaled, ['J'], storingDevice=storingDevice, storingDtype=storingDtype)
+
+def getTransformationJ(reactorType, mech, Y, dt, computationArchitechture='pt', batch_size=15_000, computationDevice=None, storingDevice=None, storingDtype=None):
+    J_chem = getChemicalJacobian(reactorType, mech, Y, computationArchitechture, batch_size, computationDevice, storingDevice, storingDtype)
+    J_transfo = - dt * J_chem.data
+    n = Y.nFeatures
+    J_transfo[:, range(n), range(n)] += 1
+    J_transfo = torch.linalg.inv(J_transfo.data)
+    return(serie(J_transfo, ['J'], storingDevice=storingDevice, storingDtype=storingDtype))
+
+def getScaledTransformationJ(reactorType, mech, X, Y, inputScaler, outputScaler, dt, computationArchitechture='pt', batch_size=15_000, computationDevice=None, storingDevice=None, storingDtype=None):
+    J_phys = getTransformationJ(reactorType, mech, Y, dt, computationArchitechture, batch_size, computationDevice, storingDevice, storingDtype)
+
+    J_out = outputScaler.J(Y)
+    J_1_in = inputScaler.J_1(inputScaler.transform(X))
+
+    J_scaled = J_out.unsqueeze(2) * J_phys.data * J_1_in.unsqueeze(1)
+    return serie(J_scaled, ['J'], storingDevice=storingDevice, storingDtype=storingDtype)

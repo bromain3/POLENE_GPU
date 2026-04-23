@@ -6,6 +6,171 @@ from torch.func import jacrev, vmap
 from tqdm import tqdm
 import gc
 
+
+
+class integratorSurogateTrainer(_statsSave):
+
+    def __init__(
+        self,
+        testSize=0.25,
+        lr=5e-3,
+        warmupSteps=2000,
+        decayRate=0.92,
+        decaySteps=1500,
+        epochs=50,
+        batchSize=128,
+        trainingDevice=None,
+        trainingDtype=None,
+    ):
+        _statsSave.__init__(self)
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+
+    # ── LR schedule (identique à JVPTrainer) ─────────────────────────────────
+
+    def warmup_exp_decay(self, k):
+        if self.warmupSteps > 0 and k < self.warmupSteps:
+            return (k + 1) / self.warmupSteps
+        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
+
+    # ── Train / test split (identique à JVPTrainer) ──────────────────────────
+
+    def trainTestSplit(self, X, Y, J):
+        if X.nSamples != Y.nSamples or J.nSamples != X.nSamples:
+            raise ValueError("X, Y and J must have the same number of samples")
+
+        N = X.nSamples
+        n_test = int(N * self.testSize)
+        indices = torch.randperm(N)
+
+        test_idx  = indices[:n_test]
+        train_idx = indices[n_test:]
+
+        return (
+            X[train_idx].contiguous(), X[test_idx].contiguous(),
+            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
+            J[train_idx].contiguous(), J[test_idx].contiguous(),
+        )
+
+
+    @staticmethod
+    def jacInvLoss(model, X, J_1):
+        # TODO: study the impact of minimizing J_pred @ J_1 - I vs J_1 @ J_pred - I vs using both
+        #  look at the random jvp projection loss to reduce the cost of autograding the full jacobian
+        x_sample = X.data.detach().requires_grad_(True)  # (N, d_in)
+        def model_fn(single_x):
+            """Appliqué sample par sample via vmap."""
+            return model(single_x.unsqueeze(0), tensorInput=True).squeeze(0)
+        # jacrev calcule la jacobienne complète d_out × d_in pour un seul x
+        # vmap vectorise sur le batch  →  (N, d_out, d_in)
+        batch_jacobian_fn = vmap(jacrev(model_fn))
+        pred_jacobians = batch_jacobian_fn(x_sample)  # (N, d_out, d_in)
+
+        left_inv = torch.bmm(pred_jacobians, J_1.data)
+        right_inv = torch.bmm(J_1.data, pred_jacobians)
+        I = torch.eye(X.nFeatures, device=X.storingDevice, dtype=X.storingDtype).unsqueeze(0).expand(X.nSamples, X.nFeatures, X.nFeatures)
+
+        return 1/2 * torch.nn.functional.mse_loss(left_inv, I) + 1/2 * torch.nn.functional.mse_loss(right_inv, I)
+
+
+
+    # ── Training phase ────────────────────────────────────────────────────────
+
+    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+        model.train()
+        totalLoss = 0.0
+        totalLossJacobian = 0.0
+        totalLossMSE = 0.0
+
+        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(optimizer.param_groups[0]['lr'])
+
+            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+            loss_jacobian = self.jacInvLoss(model, batch_X, batch_J) / 430
+
+            preds = model(batch_X)
+            loss_MSE = torch.nn.functional.mse_loss(batch_Y.data, preds.data)
+
+            loss = loss_jacobian + loss_MSE
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            lrScheduler.step()
+
+            n = batch_X.data.size(0)
+            totalLoss       += loss.item() * n
+            totalLossJacobian += loss_jacobian.item() * n
+            totalLossMSE += loss_MSE.item() * n
+
+        N = X.nSamples
+        totalLoss /= N
+        totalLossJacobian /= N
+        totalLossMSE /= N
+
+        self.stats.loss.append(totalLoss)
+        return totalLoss, totalLossJacobian, totalLossMSE
+
+    # ── Validation phase ──────────────────────────────────────────────────────
+
+    def __validationPhase(self, Xval, Yval, model, lossFunc):
+        model.eval()
+        totalLoss = 0.0
+
+        with torch.no_grad():
+            for batch in range(0, Xval.nSamples, self.batchSize):
+                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+                preds = model(batch_X)
+                loss  = lossFunc(preds.data, batch_Y.data)
+                totalLoss += loss.item() * batch_X.data.size(0)
+
+        totalLoss /= Xval.nSamples
+        self.stats.valLoss.append(totalLoss)
+        return totalLoss
+
+    # ── Point d'entrée public ─────────────────────────────────────────────────
+
+    def train(self, X, Y, J_1, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Split — on splitte X, Y et les jacobiennes avec les mêmes indices
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_1)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+
+        optimizer    = torch.optim.Adam(model.parameters(), lr=self.lr)
+        lrScheduler  = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
+        lossFunc     = nn.MSELoss()
+
+        for epoch in range(self.epochs):
+            trainLoss, lj, lv = self.__trainingPhase(X_train, Y_train, J_train, model, optimizer, lrScheduler)
+            valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
+
+            current_lr = optimizer.param_groups[0]['lr']
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}"
+                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"Val MSE: {self._format_loss(valLoss)}  |  "
+                f"LR: {current_lr:.2e}"
+            )
+
+
+
+
 class SobolevTrainer(_statsSave):
     """
     Sobolev Training — Czarnecki et al., 2017  (https://arxiv.org/abs/1706.04859)
@@ -102,7 +267,7 @@ class SobolevTrainer(_statsSave):
         batch_jacobian_fn = vmap(jacrev(model_fn))
         pred_jacobians = batch_jacobian_fn(x)                # (N, d_out, d_in)
 
-        loss_jacobians = nn.functional.mse_loss(pred_jacobians, target_jacobians.data)
+        loss_jacobians = nn.functional.mse_loss(pred_jacobians, target_jacobians.data) / 460
 
         # ── Loss totale (poids égaux, comme dans le papier) ───────────────
         lamb = 0.5
@@ -167,7 +332,7 @@ class SobolevTrainer(_statsSave):
 
     # ── Point d'entrée public ─────────────────────────────────────────────────
 
-    def train(self, X, Y, target_jacobians, model):
+    def train(self, X, Y, J_X, model):
         """
         Args:
             X                 : dataset d'entrées
@@ -179,7 +344,7 @@ class SobolevTrainer(_statsSave):
         gc.collect()
 
         # Split — on splitte X, Y et les jacobiennes avec les mêmes indices
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, target_jacobians)
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
 
         model.to(self.trainingDevice).to(self.trainingDtype)
 

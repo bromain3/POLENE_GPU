@@ -519,6 +519,7 @@ class mahanalobisTrainer(_statsSave):
         I = torch.eye(diff.shape[1], device=self.trainingDevice, dtype=self.trainingDtype).unsqueeze(0)
         M = (1 - self.lamb) * I + self.lamb * J  # (B, d, d)
 
+        # TODO: add option to normalize or not the matrix as it changes a bit the results (normalizing sample per sample is not equivalent to normalizing globaly on the batch)
         #norms = torch.linalg.norm(M, ord='fro', dim=(1, 2))  # Shape: (B,)
         #norms = norms.unsqueeze(-1).unsqueeze(-1)
         #M_scaled = diff.shape[1] ** (1/2) * M / norms
