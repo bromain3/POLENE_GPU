@@ -168,6 +168,254 @@ class integratorSurogateTrainer(_statsSave):
                 f"LR: {current_lr:.2e}"
             )
 
+class DirectionalGradNormSobolevTrainer(_statsSave):
+    """
+    Sobolev Training directional avec GradNorm pour équilibrer automatiquement
+    les pertes sur les valeurs et les jacobiennes directionnelles.
+    """
+
+    def __init__(
+        self,
+        testSize=0.25,
+        lr=5e-3,
+        warmupSteps=2000,
+        decayRate=0.92,
+        decaySteps=1500,
+        epochs=50,
+        batchSize=128,
+        trainingDevice=None,
+        trainingDtype=None,
+        # --- Paramètres GradNorm ---
+        alpha=0.5,
+        gradnormLr=1e-3,
+        emaBeta=0.99,
+    ):
+        _statsSave.__init__(self)
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+
+        # GradNorm
+        self.alpha = alpha
+        self.gradnormLr = gradnormLr
+        self.emaBeta = emaBeta
+
+        # Initialisés dans train() une fois le device connu
+        self.taskWeights = None
+        self.weightOptimizer = None
+        self.emaValues = None
+        self.emaJacob = None
+
+    # ── LR schedule ──────────────────────────────────────────────────────────
+
+    def warmup_exp_decay(self, k):
+        if self.warmupSteps > 0 and k < self.warmupSteps:
+            return (k + 1) / self.warmupSteps
+        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
+
+    # ── Train / test split ────────────────────────────────────────────────────
+
+    def trainTestSplit(self, X, Y, J):
+        if X.nSamples != Y.nSamples or J.nSamples != X.nSamples:
+            raise ValueError("X, Y and J must have the same number of samples")
+
+        N = X.nSamples
+        n_test = int(N * self.testSize)
+        indices = torch.randperm(N)
+
+        test_idx  = indices[:n_test]
+        train_idx = indices[n_test:]
+
+        return (
+            X[train_idx].contiguous(), X[test_idx].contiguous(),
+            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
+            J[train_idx].contiguous(), J[test_idx].contiguous(),
+        )
+
+    # ── EMA des pertes (pour le training rate de GradNorm) ───────────────────
+
+    def _update_ema(self, loss_values, loss_jacob):
+        lv = loss_values.detach()
+        lj = loss_jacob.detach()
+
+        if self.emaValues is None:
+            self.emaValues = lv
+            self.emaJacob  = lj
+        else:
+            self.emaValues = self.emaBeta * self.emaValues + (1 - self.emaBeta) * lv
+            self.emaJacob  = self.emaBeta * self.emaJacob  + (1 - self.emaBeta) * lj
+
+        mean = (self.emaValues + self.emaJacob) / 2.0 + 1e-8
+        r_values = self.emaValues / mean
+        r_jacob  = self.emaJacob  / mean
+        return r_values, r_jacob
+
+    # ── Calcul des deux termes de Sobolev (sans pondération) ─────────────────
+
+    @staticmethod
+    def _compute_losses(model, batch_X, batch_Y, target_jacobians):
+        v = batch_Y.data - batch_X.data  # (N, d_in)
+
+        preds = model(batch_X)
+
+        def model_fn(x):
+            return model(x, tensorInput=True)
+
+        _, Jv_pred = torch.func.jvp(
+            model_fn,
+            (batch_X.data,),
+            (v,)
+        )  # (N, d)
+
+        # Terme 1 : MSE valeurs
+        loss_values = nn.functional.mse_loss(preds.data, batch_Y.data)
+
+        # Terme 2 : MSE directionnelle
+        Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (N, d_out)
+        loss_jacob = nn.functional.mse_loss(Jv_pred, Jv_true)
+
+        return loss_values, loss_jacob
+
+    # ── GradNorm : norme du gradient d'une perte par rapport aux paramètres ──
+
+    @staticmethod
+    def _grad_norm(loss, params):
+        grads = torch.autograd.grad(loss, params, retain_graph=True, create_graph=True)
+        return torch.norm(torch.stack([g.norm() for g in grads if g is not None]))
+
+    # ── Training phase ────────────────────────────────────────────────────────
+
+    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+        model.train()
+        totalLoss        = 0.0
+        totalLossValues  = 0.0
+        totalLossJacob   = 0.0
+
+        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(optimizer.param_groups[0]['lr'])
+
+            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+            # --- Termes bruts ---
+            loss_values, loss_jacob = self._compute_losses(model, batch_X, batch_Y, batch_J)
+
+            # --- Poids softmax ---
+            weights = torch.softmax(self.taskWeights, dim=0)
+            weighted_lv = weights[0] * loss_values
+            weighted_lj = weights[1] * loss_jacob
+            loss = weighted_lv + weighted_lj
+
+            # --- GradNorm ---
+            shared_params = [p for p in model.parameters() if p.requires_grad]
+
+            G1 = self._grad_norm(weighted_lv, shared_params)
+            G2 = self._grad_norm(weighted_lj, shared_params)
+            G_avg = (G1 + G2) / 2.0
+
+            r1, r2 = self._update_ema(loss_values, loss_jacob)
+
+            grad_loss = (
+                torch.abs(G1 - G_avg * (r1 ** self.alpha)) +
+                torch.abs(G2 - G_avg * (r2 ** self.alpha))
+            )
+
+            # Mise à jour des poids de tâche
+            self.weightOptimizer.zero_grad()
+            grad_loss.backward(retain_graph=True)
+            self.weightOptimizer.step()
+
+            # Renormalisation des poids (convention GradNorm)
+            with torch.no_grad():
+                self.taskWeights.data = (
+                    self.taskWeights.data.relu() /
+                    (self.taskWeights.data.relu().sum() + 1e-8) * 2
+                )
+
+            # Mise à jour du modèle
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            lrScheduler.step()
+
+            n = batch_X.data.size(0)
+            totalLoss       += loss.item()       * n
+            totalLossValues += loss_values.item() * n
+            totalLossJacob  += loss_jacob.item()  * n
+
+        N = X.nSamples
+        totalLoss       /= N
+        totalLossValues /= N
+        totalLossJacob  /= N
+
+        self.stats.loss.append(totalLoss)
+        return totalLoss, totalLossValues, totalLossJacob
+
+    # ── Validation phase ──────────────────────────────────────────────────────
+
+    def __validationPhase(self, Xval, Yval, model, lossFunc):
+        model.eval()
+        totalLoss = 0.0
+
+        with torch.no_grad():
+            for batch in range(0, Xval.nSamples, self.batchSize):
+                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+                preds = model(batch_X)
+                loss  = lossFunc(preds.data, batch_Y.data)
+                totalLoss += loss.item() * batch_X.data.size(0)
+
+        totalLoss /= Xval.nSamples
+        self.stats.valLoss.append(totalLoss)
+        return totalLoss
+
+    # ── Point d'entrée public ─────────────────────────────────────────────────
+
+    def train(self, X, Y, J_X, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+
+        # Initialisation des poids GradNorm (sur le bon device)
+        self.taskWeights = nn.Parameter(
+            torch.ones(2, device=self.trainingDevice, dtype=self.trainingDtype)
+        )
+        self.weightOptimizer = torch.optim.Adam([self.taskWeights], lr=self.gradnormLr)
+        self.emaValues = None
+        self.emaJacob  = None
+
+        optimizer   = torch.optim.Adam(model.parameters(), lr=self.lr)
+        lrScheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
+        lossFunc    = nn.MSELoss()
+
+        for epoch in range(self.epochs):
+            trainLoss, lv, lj = self.__trainingPhase(
+                X_train, Y_train, J_train, model, optimizer, lrScheduler
+            )
+            valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
+
+            weights = torch.softmax(self.taskWeights, dim=0).detach()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}"
+                f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"Val MSE: {self._format_loss(valLoss)}  |  "
+                f"w_val: {weights[0]:.3f}  w_jac: {weights[1]:.3f}  |  "
+                f"LR: {current_lr:.2e}"
+            )
 
 
 
