@@ -6,7 +6,6 @@ import torch
 
 class logScaler(_BaseTransform):
     def __init__(self, threshold):
-        raise NotImplementedError('There seems to be an issue, particularly with the jacobian part')
         self.threshold = threshold
 
         self._species_mask = None
@@ -46,12 +45,11 @@ class logScaler(_BaseTransform):
 
     def _forward(self, data):
         out = data.clone()
-        clipped = torch.where(
-            data[:, self._species_mask] <= self._threshold_tensor(data.device, data.dtype),
-            self._threshold_tensor(data.device, data.dtype),
-            data[:, self._species_mask],
-        )
-        out[:, self._species_mask] = clipped.log()
+        t = self._threshold_tensor(data.device, data.dtype)
+
+        col = data[:, self._species_mask]
+        safe_col = torch.where(col > t, col, t)  # jamais <= 0 si threshold > 0
+        out[:, self._species_mask] = safe_col.log()
         return out
 
     def _backward(self, data):
@@ -123,14 +121,12 @@ class logScaler(_BaseTransform):
         N, F = x.data.shape
         J = torch.ones(N, F, device=x.storingDevice, dtype=x.storingDtype)
 
-        t   = self._threshold_tensor(x.storingDevice, x.storingDtype)
+        t = self._threshold_tensor(x.storingDevice, x.storingDtype)
         col = x.data[:, self._species_mask]
 
-        J[:, self._species_mask] = torch.where(
-            col > t,
-            1.0 / col,
-            torch.zeros_like(col),
-        )
+        above = col > t
+        safe_col = torch.where(above, col, torch.ones_like(col))
+        J[:, self._species_mask] = torch.where(above, 1.0 / safe_col, torch.zeros_like(col))
 
         return J.to(x.storingDevice).to(x.storingDtype)
 

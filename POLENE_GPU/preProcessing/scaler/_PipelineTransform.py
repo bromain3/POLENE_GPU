@@ -69,11 +69,17 @@ class _PipelineTransform(_BaseTransform):
 
     def J_1(self, x):
         #TODO: raise an error if the jacobian is not diagonal
-        J = self.J(x)
-        mask = J != 0
-        J_inv = torch.zeros_like(J)
-        J_inv[mask] = 1.0 / J[mask]
-        return J_inv
+        intermediates = [x]
+        current = x
+        for step in reversed(self.steps[1:]):
+            current = step.inverse_transform(current)
+            intermediates.append(current)
+
+        J_total = self.steps[-1].J_1(intermediates[0])
+        for step, x_in in zip(reversed(self.steps[:-1]), intermediates[1:]):
+            J_total = J_total * step.J_1(x_in)
+
+        return J_total
 
     def __repr__(self) -> str:
         steps_repr = " → ".join(type(s).__name__ for s in self.steps)

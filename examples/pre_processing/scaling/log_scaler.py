@@ -43,7 +43,7 @@ with Timer("Inverse transform jacobian"):
     J_1 = scaler.J_1(transform_results)
 
 
-print(f'Sample: {(J * J_1)[0]}')
+print(f'Sample: {(J * J_1)[0]}\n{(J * J_1)[5]}\n{(J * J_1)[-1]}')
 
 plt.plot(tX['t'].cpu().detach().numpy(), X['T'].cpu().detach().numpy(), label='original')
 plt.plot(tX['t'].cpu().detach().numpy(), invtransform_results['T'].cpu().detach().numpy(), linestyle='--', label='transformed-unstransformed')

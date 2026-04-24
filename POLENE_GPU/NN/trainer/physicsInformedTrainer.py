@@ -235,7 +235,7 @@ class SobolevTrainer(_statsSave):
     # ── Sobolev loss ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def sobolev_loss(model, batch_X, batch_Y, target_jacobians):
+    def sobolev_loss(model, batch_X, batch_Y, target_jacobians, jacobianScaler):
         """
         Calcule la loss de Sobolev exacte du papier.
 
@@ -267,17 +267,48 @@ class SobolevTrainer(_statsSave):
         batch_jacobian_fn = vmap(jacrev(model_fn))
         pred_jacobians = batch_jacobian_fn(x)                # (N, d_out, d_in)
 
-        loss_jacobians = nn.functional.mse_loss(pred_jacobians, target_jacobians.data) / 460
+
+        #print("Unscaled pred", torch.isnan(pred_jacobians).any())  # dans sobolev_loss
+        #print("Unscaled true" , torch.isnan(target_jacobians.data).any())  # idem
+
+        #scaled_pred_jacobian = jacobianScaler.transformTorch(pred_jacobians)
+        #scaled_target_jacobian = jacobianScaler.transformTorch(target_jacobians.data)
+
+        #print("scaled pred", torch.isnan(scaled_pred_jacobian).any())  # dans sobolev_loss
+        #print("scaled true" , torch.isnan(scaled_target_jacobian.data).any())  # idem
+
+        #loss_jacobians = nn.functional.mse_loss(scaled_pred_jacobian, scaled_target_jacobian)
+        #loss_jacobians = nn.functional.mse_loss(pred_jacobians, target_jacobians.data)  # unscaled jacobian
+
+        v = batch_Y.data - batch_X.data
+        #print(v.norm(dim=1, keepdim=True))
+        #v = v / v.norm(dim=1, keepdim=True)
+        # TODO: scaling to prevent that samples with huge Y-X (combustion zone) are more represented in the loss. If we do not normalize, the training is unstable and we can see that the combustion zone is musch more refined
+        #  whene not scaled, the validation loss approximately folows the the jacobian loss but whene scaled it is not the case at all, it is quite the oposite
+        #  however, whene scaling the v, minimizing Jloss increases mse and oposite. the behaviour completlly changes
+        v_expanded = v.unsqueeze(2)
+        Jv_pred = torch.bmm(pred_jacobians, v_expanded)
+        Jv_true = torch.bmm(target_jacobians.data, v_expanded)
+        # enlever la dernière dimension → (N, d_out)
+        Jv_pred = Jv_pred.squeeze(2)
+        Jv_true = Jv_true.squeeze(2)
+
+        # loss
+        loss_jacobians = nn.functional.mse_loss(Jv_pred, Jv_true)
+        # TODO: we can see the directional jvp loss is diminishing even when not constrained, while the loss on the full jacobian diminishes slightly but nearly not.
+        #  It could be interesting to define v as a vector of norm Y - X but with a direction slightly different (within a cone) so that the network can learn the jacobian slightly outside the direction of the manifold
+        #  or we could define v = X - really small perturbation on X so that the network learns the impact of an error, but it is close to stochastic sobolev learning and it is surelly not stable.
+        #  Thus, perturbing the direction of Y-X is the preferd piste of recherche
 
         # ── Loss totale (poids égaux, comme dans le papier) ───────────────
-        lamb = 0.5
-        loss = lamb/2 * loss_values + (1-lamb)/2 * loss_jacobians
+        lamb = 1
+        loss = lamb * loss_values + (1-lamb) * loss_jacobians
 
         return loss, loss_values.detach(), loss_jacobians.detach()
 
     # ── Training phase ────────────────────────────────────────────────────────
 
-    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+    def __trainingPhase(self, X, Y, target_jacobians, jacobianScaler, model, optimizer, lrScheduler):
         model.train()
         totalLoss        = 0.0
         totalLossValues  = 0.0
@@ -291,10 +322,11 @@ class SobolevTrainer(_statsSave):
             batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             # batch_J : (B, d_out, d_in) — jacobiennes cibles ∇_x f(xᵢ)
 
-            loss, lv, lj = self.sobolev_loss(model, batch_X, batch_Y, batch_J)
+            loss, lv, lj = self.sobolev_loss(model, batch_X, batch_Y, batch_J, jacobianScaler)
 
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             lrScheduler.step()
 
@@ -332,7 +364,7 @@ class SobolevTrainer(_statsSave):
 
     # ── Point d'entrée public ─────────────────────────────────────────────────
 
-    def train(self, X, Y, J_X, model):
+    def train(self, X, Y, J_X, model, jacobianScaler):
         """
         Args:
             X                 : dataset d'entrées
@@ -354,7 +386,7 @@ class SobolevTrainer(_statsSave):
 
         for epoch in range(self.epochs):
             trainLoss, lv, lj = self.__trainingPhase(
-                X_train, Y_train, J_train, model, optimizer, lrScheduler
+                X_train, Y_train, J_train, jacobianScaler, model, optimizer, lrScheduler
             )
             valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
 
@@ -362,7 +394,7 @@ class SobolevTrainer(_statsSave):
             print(
                 f"[{epoch + 1}/{self.epochs}] "
                 f"Train: {self._format_loss(trainLoss)}"
-                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)}  |  "
                 f"Val MSE: {self._format_loss(valLoss)}  |  "
                 f"LR: {current_lr:.2e}"
             )
@@ -891,6 +923,11 @@ class dataJVPTrainer(_statsSave):
                 f"LR: {current_lr:.2e}"
             )
 
+
+def flatten(grads):
+    return torch.cat([
+        g.reshape(-1) for g in grads if g is not None
+    ])
 
 # TODO: faire un trainer qui minimise ||J_pred(X-Y) - J_true(X-Y)||^2 afin d'entrainer la jacobienne dans le sens de la transformation. c'est proche des equations de
 #  l'integrateur implicite et ça permet d'apprendre la jacobienne de la tranfo, ce qui est assez important pour la généralisation.
