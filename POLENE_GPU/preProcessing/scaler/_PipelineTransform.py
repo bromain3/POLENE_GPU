@@ -61,9 +61,12 @@ class _PipelineTransform(_BaseTransform):
             intermediates.append(current)
 
         J_total = self.steps[-1].J(intermediates[-1])
+        _check_nan(J_total, self.steps[-1], "J")
 
         for step, x_in in zip(reversed(self.steps[:-1]), reversed(intermediates[:-1])):
-            J_total = J_total * step.J(x_in)
+            J_step = step.J(x_in)
+            _check_nan(J_step, step, "J")
+            J_total = J_total * J_step
 
         return J_total
 
@@ -76,11 +79,21 @@ class _PipelineTransform(_BaseTransform):
             intermediates.append(current)
 
         J_total = self.steps[-1].J_1(intermediates[0])
+        _check_nan(J_total, self.steps[-1], "J_1")
         for step, x_in in zip(reversed(self.steps[:-1]), intermediates[1:]):
-            J_total = J_total * step.J_1(x_in)
+            J_step = step.J_1(x_in)
+            _check_nan(J_step, step, "J_1")
+            J_total = J_total * J_step
 
         return J_total
 
     def __repr__(self) -> str:
         steps_repr = " → ".join(type(s).__name__ for s in self.steps)
         return f"_PipelineTransform([{steps_repr}])"
+
+def _check_nan(tensor, step, method_name):
+    if torch.isnan(tensor).any():
+        raise ValueError(
+            f"NaN detected in {method_name}() output of {step!r}. "
+            f"Check your scaler parameters (e.g. min_shift too small for the dtype)."
+        )

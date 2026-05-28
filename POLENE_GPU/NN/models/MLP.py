@@ -3,44 +3,65 @@ from POLENE_GPU.NN.models._wrapper import _wrapper
 import torch.nn as nn
 import torch.nn.functional as F
 
-class _ResBlock(nn.Module):
-    def __init__(self, features_dim, hidden_dim):
+class _hiddenLayer(nn.Module):
+    def __init__(self, hidden_dim, layerNorm=True):
         super().__init__()
-        self.linear1 = nn.Linear(features_dim, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, features_dim)
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.useLayerNorm = layerNorm
+
+        if self.useLayerNorm:
+            self.net = nn.Sequential(
+                self.linear,
+                nn.LayerNorm(hidden_dim),
+                self.act
+                )
+        else:
+            self.net = nn.Sequential(
+                self.linear,
+                self.act
+                )
 
     def forward(self, x):
-        x = F.silu(self.linear1(x))
-        x = self.linear2(x)
-        return F.silu(x)
+        return(self.net(x))
 
-class _ResNet(nn.Module):
-    def __init__(self, features_dim, nb_blocks, hidden_dim):
+class _MLP(nn.Module):
+    def __init__(self, nb_layers, hidden_dim, layerNorm=True):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            _ResBlock(features_dim, hidden_dim) for _ in range(nb_blocks)
+        self.network = nn.Sequential(*[
+            _hiddenLayer(hidden_dim, layerNorm) for _ in range(nb_layers)
         ])
 
     def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        return x
+        return(self.network(x))
 
 class MLP(_wrapper):
-    def __init__(self, input_dim, backbone_dim, nb_blocks, hidden_dim):
+    def __init__(self, input_dim, nb_layers, hidden_dim, layerNorm=True):
         nn.Module.__init__(self)
         _wrapper.__init__(self)
 
-        self.bck = backbone_dim
-        self.nb_blocks = nb_blocks
-        self.dim = hidden_dim
+        self.input = nn.Linear(input_dim, hidden_dim)
+        self.input_act = nn.SiLU()
+        self.core = _MLP(nb_layers, hidden_dim, layerNorm)
+        self.output = nn.Linear(hidden_dim, input_dim)
 
-        self.input_dim = input_dim
-        self.backbone = nn.Linear(input_dim, backbone_dim)
-        self.resnet = _ResNet(backbone_dim, nb_blocks, hidden_dim)
-        self.output_layer = nn.Linear(backbone_dim, input_dim)
+        if layerNorm:
+            self.net = nn.Sequential(
+                self.input,
+                nn.LayerNorm(hidden_dim),
+                self.input_act,
+                self.core,
+                self.output
+            )
+        else:
+            self.net = nn.Sequential(
+                self.input,
+                self.input_act,
+                self.core,
+                self.output
+            )
 
-        self.init_weights()
+        #self.init_weights()
 
     def init_weights(self):
         for m in self.modules():
@@ -50,8 +71,4 @@ class MLP(_wrapper):
                     nn.init.zeros_(m.bias)
 
     def torchForward(self, x):
-        x = F.silu(self.backbone(x))
-        x = self.resnet(x)
-        x = F.silu(x)
-        x = self.output_layer(x)
-        return x
+        return(self.net(x))

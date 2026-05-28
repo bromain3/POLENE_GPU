@@ -1,30 +1,18 @@
 import torch
+from tqdm import tqdm
 
-def batched_apply(fn, *tensors, batch_size, device, dtype=None):
-    """
-    Applique fn par batch sur GPU, stocke les résultats sur CPU.
-
-    fn         : callable torch
-    *tensors   : tenseurs d'entrée (sur CPU ou GPU)
-    batch_size : taille des batchs
-    device     : device de calcul (ex: torch.device('cuda:0'))
-    dtype      : cast optionnel avant calcul
-    """
+def batched_apply(fn, *tensors, batch_size=None, device=None, dtype=None):
     N = tensors[0].shape[0]
-    results = []
 
-    for start in range(0, N, batch_size):
-        batch_inputs = []
-        print(start/N)
-        for t in tensors:
-            b = t[start:start + batch_size].to(device)
-            if dtype is not None:
-                b = b.to(dtype)
-            batch_inputs.append(b)
-
+    def process_batch(start, end):
+        batch_inputs = [t[start:end].to(device) for t in tensors]
+        if dtype is not None:
+            batch_inputs = [b.to(dtype) for b in batch_inputs]
         with torch.no_grad():
-            out = fn(*batch_inputs)
+            return fn(*batch_inputs).cpu()
 
-        results.append(out.cpu())
+    if batch_size is None:
+        return process_batch(0, N)
 
+    results = [process_batch(start, start + batch_size) for start in tqdm(range(0, N, batch_size))]
     return torch.cat(results, dim=0)

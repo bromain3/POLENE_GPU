@@ -3,7 +3,8 @@ import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
 from POLENE_GPU.NN.models.resNet import ResNet
-from POLENE_GPU.databaseGeneration.standalone.oversampler import generateIntermediateSamples
+from POLENE_GPU.NN.models.integratorNet import IntegratorNet
+from POLENE_GPU.databaseGeneration.standalone.oversamplerAdaptativeTimeStep import generateIntermediateSamples
 from POLENE_GPU.NN.trainer.baseTrainer import baseTrainer
 from POLENE_GPU.NN.trainer.mahanalobisTrainer import mahanalobisTrainer, jacobianMahanalobisTrainer, mahanalobisTrainerGradNorm
 from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
@@ -13,7 +14,7 @@ from POLENE_GPU.misc.timer import Timer
 from POLENE_GPU.misc.batchFunction import batched_apply
 from POLENE_GPU.dataHandler.serie import serie
 import POLENE_GPU.databaseGeneration.standalone.NeuralCFD as NeuNeu
-from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ_1
+from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ
 
 
 import kineticsGPU.torch.reactors.constantV as cstVreactorTorch
@@ -37,9 +38,9 @@ JVPDtype = torch.float64
 JVPDevice = torch.device('cuda:1')
 
 mech = 'gri30.yaml'
-dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100_1500_cells.h5'
+dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100_1500_cells_64bits_cantera_high_num_tol.h5'
 undersamplingProp = 0.3  # TODO: study the impact of oversampling before or after the uniform undersampling. I think the cleanest would be to oversample and then undersample
-classicTraining = True  #  ~ 1.731e-5 en val avec training classique (test == val étonnement)
+classicTraining = False  #  ~ 1.731e-5 en val avec training classique (test == val étonnement)
 dtcfd = 1e-7
 
 with Timer("Model creation"):
@@ -68,27 +69,39 @@ with Timer("Dataset generation"):
     Xdtb = Xdtb[indices]
     Ydtb = Ydtb[indices]
 
-with Timer("Oversampling"):
-    X_more, Y_more = generateIntermediateSamples(Xdtb, dtcfd, "cstV", mech, CPUparallelProcessing, chunksize=1500)
-    # TODO: il faudrait soint concat X_more et Y_more à Xdtb et Ydtb soit que X_more et Y_more incorporent directement X_dtb et Y_dtb mais pour l'instant on laisse tomber
-    n = int(X_more.nSamples * undersamplingProp)
-    indices = torch.randperm(X_more.nSamples)[:n]
-    X_more = X_more[indices]
-    Y_more = Y_more[indices]
+#with Timer("Oversampling"):
+#    X_more, Y_more = generateIntermediateSamples(Xdtb, dtcfd, "cstV", mech, CPUparallelProcessing, chunksize=1500)
+#    # TODO: il faudrait soint concat X_more et Y_more à Xdtb et Ydtb soit que X_more et Y_more incorporent directement X_dtb et Y_dtb mais pour l'instant on laisse tomber
+#    n = int(X_more.nSamples * undersamplingProp)
+#    indices = torch.randperm(X_more.nSamples)[:n]
+#    X_more = X_more[indices]
+#    Y_more = Y_more[indices]
 
 with Timer("Model creation"):
-    model = ResNet(X_more.nFeatures, 54, 2, 350, layerNorm=True)
+    model = IntegratorNet(
+        input_dim=Xdtb.nFeatures,
+        source_dim=55,  # taille de la représentation "terme source"
+        source_layers=2,  # profondeur de la branche source
+        source_width=350,  # largeur de la branche source
+        integrator_layers=2,  # profondeur de l'intégrateur
+        integrator_width=350,  # largeur de l'intégrateur
+        layerNorm=True,
+        activationOnOutput=False,
+    )
+    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
+
+
 
 with Timer("Database scaling"):
     scaler = stdScaler()
-    Xdtb_scaled = scaler.fit_transform(X_more)
-    Ydtb_scaled = scaler.transform(Y_more)
+    Xdtb_scaled = scaler.fit_transform(Xdtb)
+    Ydtb_scaled = scaler.transform(Ydtb)
     model.inputScaler = scaler
     model.outputScaler = scaler
 
 if not classicTraining:
     with Timer("Computing per thread jacobian"):
-        J_Y_scaled = getScaledTransformationJ_1("cstV", mech, Xdtb_scaled, Ydtb_scaled, model.inputScaler, model.outputScaler,
+        J_Y_scaled = getScaledTransformationJ("cstV", mech, Xdtb, Ydtb, model.inputScaler, model.outputScaler,
                                                 reactormodel.dtcfd, computationArchitechture='pt', batch_size=15_000,
                                                 computationDevice=JVPDevice, storingDevice=savingDevice,
                                                 storingDtype=savingDdtype)
@@ -96,7 +109,7 @@ if not classicTraining:
 
 with Timer("Trainer initialisation"):
     if not classicTraining:
-        trainer = mahanalobisTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, lamb=3)
+        trainer = mahanalobisTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, lamb=0)
         #trainer = mahanalobisTrainerGradNorm(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)
     else:
         trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)

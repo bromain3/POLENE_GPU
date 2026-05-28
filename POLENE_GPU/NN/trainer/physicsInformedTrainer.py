@@ -1,28 +1,44 @@
 from POLENE_GPU.NN.trainer._statsSave import _statsSave
+from POLENE_GPU.NN.trainer._mixins import SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin, PCGradMixin, EffectiveRankMixin
+from POLENE_GPU.NN.trainer._losses import (
+    directional_sobolev_losses,
+    full_sobolev_loss,
+    jac_inv_loss,
+    directional_sobolev_losses_cone,
+    manifoldJacobianLoss,
+    manifoldJacobianLoss_cone
+)
 
 import torch
 import torch.nn as nn
-from torch.func import jacrev, vmap
 from tqdm import tqdm
 import gc
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+class DirectionalSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, EffectiveRankMixin):
+    """
+    Directional Sobolev training with fixed λ weighting.
 
-class integratorSurogateTrainer(_statsSave):
+    loss = (1 - λ) * MSE(values) + λ * MSE(J·v)   with v = Y - X
+    """
 
     def __init__(
-        self,
-        testSize=0.25,
-        lr=5e-3,
-        warmupSteps=2000,
-        decayRate=0.92,
-        decaySteps=1500,
-        epochs=50,
-        batchSize=128,
-        trainingDevice=None,
-        trainingDtype=None,
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            lmbda=0.5,
     ):
         _statsSave.__init__(self)
+        if not 0.0 <= lmbda <= 1.0:
+            raise ValueError("lmbda must be in [0, 1]")
         self.testSize = testSize
         self.lr = lr
         self.warmupSteps = warmupSteps
@@ -32,353 +48,39 @@ class integratorSurogateTrainer(_statsSave):
         self.batchSize = batchSize
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
-
-    # ── LR schedule (identique à JVPTrainer) ─────────────────────────────────
-
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
-
-    # ── Train / test split (identique à JVPTrainer) ──────────────────────────
-
-    def trainTestSplit(self, X, Y, J):
-        if X.nSamples != Y.nSamples or J.nSamples != X.nSamples:
-            raise ValueError("X, Y and J must have the same number of samples")
-
-        N = X.nSamples
-        n_test = int(N * self.testSize)
-        indices = torch.randperm(N)
-
-        test_idx  = indices[:n_test]
-        train_idx = indices[n_test:]
-
-        return (
-            X[train_idx].contiguous(), X[test_idx].contiguous(),
-            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
-            J[train_idx].contiguous(), J[test_idx].contiguous(),
-        )
-
-
-    @staticmethod
-    def jacInvLoss(model, X, J_1):
-        # TODO: study the impact of minimizing J_pred @ J_1 - I vs J_1 @ J_pred - I vs using both
-        #  look at the random jvp projection loss to reduce the cost of autograding the full jacobian
-        x_sample = X.data.detach().requires_grad_(True)  # (N, d_in)
-        def model_fn(single_x):
-            """Appliqué sample par sample via vmap."""
-            return model(single_x.unsqueeze(0), tensorInput=True).squeeze(0)
-        # jacrev calcule la jacobienne complète d_out × d_in pour un seul x
-        # vmap vectorise sur le batch  →  (N, d_out, d_in)
-        batch_jacobian_fn = vmap(jacrev(model_fn))
-        pred_jacobians = batch_jacobian_fn(x_sample)  # (N, d_out, d_in)
-
-        left_inv = torch.bmm(pred_jacobians, J_1.data)
-        right_inv = torch.bmm(J_1.data, pred_jacobians)
-        I = torch.eye(X.nFeatures, device=X.storingDevice, dtype=X.storingDtype).unsqueeze(0).expand(X.nSamples, X.nFeatures, X.nFeatures)
-
-        return 1/2 * torch.nn.functional.mse_loss(left_inv, I) + 1/2 * torch.nn.functional.mse_loss(right_inv, I)
-
-
-
-    # ── Training phase ────────────────────────────────────────────────────────
+        self.lmbda = lmbda
 
     def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
         model.train()
-        totalLoss = 0.0
-        totalLossJacobian = 0.0
-        totalLossMSE = 0.0
+        totalLoss = totalLV = totalLJ = 0.0
 
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
-            loss_jacobian = self.jacInvLoss(model, batch_X, batch_J) / 430
-
-            preds = model(batch_X)
-            loss_MSE = torch.nn.functional.mse_loss(batch_Y.data, preds.data)
-
-            loss = loss_jacobian + loss_MSE
+            lv, lj = directional_sobolev_losses(model, bX, bY, bJ)
+            loss = (1.0 - self.lmbda) * lv + self.lmbda * lj
 
             optimizer.zero_grad()
             loss.backward()
+            #nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             lrScheduler.step()
 
-            n = batch_X.data.size(0)
-            totalLoss       += loss.item() * n
-            totalLossJacobian += loss_jacobian.item() * n
-            totalLossMSE += loss_MSE.item() * n
+            n = bX.data.size(0)
+            totalLoss += loss.item() * n
+            totalLV += lv.item() * n
+            totalLJ += lj.item() * n
 
         N = X.nSamples
-        totalLoss /= N
-        totalLossJacobian /= N
-        totalLossMSE /= N
-
+        totalLoss /= N;
+        totalLV /= N;
+        totalLJ /= N
         self.stats.loss.append(totalLoss)
-        return totalLoss, totalLossJacobian, totalLossMSE
-
-    # ── Validation phase ──────────────────────────────────────────────────────
-
-    def __validationPhase(self, Xval, Yval, model, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss  = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-        return totalLoss
-
-    # ── Point d'entrée public ─────────────────────────────────────────────────
-
-    def train(self, X, Y, J_1, model):
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        # Split — on splitte X, Y et les jacobiennes avec les mêmes indices
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_1)
-
-        model.to(self.trainingDevice).to(self.trainingDtype)
-
-        optimizer    = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler  = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
-        lossFunc     = nn.MSELoss()
-
-        for epoch in range(self.epochs):
-            trainLoss, lj, lv = self.__trainingPhase(X_train, Y_train, J_train, model, optimizer, lrScheduler)
-            valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
-
-            current_lr = optimizer.param_groups[0]['lr']
-            print(
-                f"[{epoch + 1}/{self.epochs}] "
-                f"Train: {self._format_loss(trainLoss)}"
-                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
-                f"Val MSE: {self._format_loss(valLoss)}  |  "
-                f"LR: {current_lr:.2e}"
-            )
-
-class DirectionalGradNormSobolevTrainer(_statsSave):
-    """
-    Sobolev Training directional avec GradNorm pour équilibrer automatiquement
-    les pertes sur les valeurs et les jacobiennes directionnelles.
-    """
-
-    def __init__(
-        self,
-        testSize=0.25,
-        lr=5e-3,
-        warmupSteps=2000,
-        decayRate=0.92,
-        decaySteps=1500,
-        epochs=50,
-        batchSize=128,
-        trainingDevice=None,
-        trainingDtype=None,
-        # --- Paramètres GradNorm ---
-        alpha=0.5,
-        gradnormLr=1e-3,
-        emaBeta=0.99,
-    ):
-        _statsSave.__init__(self)
-        self.testSize = testSize
-        self.lr = lr
-        self.warmupSteps = warmupSteps
-        self.decayRate = decayRate
-        self.decaySteps = decaySteps
-        self.epochs = epochs
-        self.batchSize = batchSize
-        self.trainingDevice = trainingDevice
-        self.trainingDtype = trainingDtype
-
-        # GradNorm
-        self.alpha = alpha
-        self.gradnormLr = gradnormLr
-        self.emaBeta = emaBeta
-
-        # Initialisés dans train() une fois le device connu
-        self.taskWeights = None
-        self.weightOptimizer = None
-        self.emaValues = None
-        self.emaJacob = None
-
-    # ── LR schedule ──────────────────────────────────────────────────────────
-
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
-
-    # ── Train / test split ────────────────────────────────────────────────────
-
-    def trainTestSplit(self, X, Y, J):
-        if X.nSamples != Y.nSamples or J.nSamples != X.nSamples:
-            raise ValueError("X, Y and J must have the same number of samples")
-
-        N = X.nSamples
-        n_test = int(N * self.testSize)
-        indices = torch.randperm(N)
-
-        test_idx  = indices[:n_test]
-        train_idx = indices[n_test:]
-
-        return (
-            X[train_idx].contiguous(), X[test_idx].contiguous(),
-            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
-            J[train_idx].contiguous(), J[test_idx].contiguous(),
-        )
-
-    # ── EMA des pertes (pour le training rate de GradNorm) ───────────────────
-
-    def _update_ema(self, loss_values, loss_jacob):
-        lv = loss_values.detach()
-        lj = loss_jacob.detach()
-
-        if self.emaValues is None:
-            self.emaValues = lv
-            self.emaJacob  = lj
-        else:
-            self.emaValues = self.emaBeta * self.emaValues + (1 - self.emaBeta) * lv
-            self.emaJacob  = self.emaBeta * self.emaJacob  + (1 - self.emaBeta) * lj
-
-        mean = (self.emaValues + self.emaJacob) / 2.0 + 1e-8
-        r_values = self.emaValues / mean
-        r_jacob  = self.emaJacob  / mean
-        return r_values, r_jacob
-
-    # ── Calcul des deux termes de Sobolev (sans pondération) ─────────────────
-
-    @staticmethod
-    def _compute_losses(model, batch_X, batch_Y, target_jacobians):
-        v = batch_Y.data - batch_X.data  # (N, d_in)
-
-        preds = model(batch_X)
-
-        def model_fn(x):
-            return model(x, tensorInput=True)
-
-        _, Jv_pred = torch.func.jvp(
-            model_fn,
-            (batch_X.data,),
-            (v,)
-        )  # (N, d)
-
-        # Terme 1 : MSE valeurs
-        loss_values = nn.functional.mse_loss(preds.data, batch_Y.data)
-
-        # Terme 2 : MSE directionnelle
-        Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (N, d_out)
-        loss_jacob = nn.functional.mse_loss(Jv_pred, Jv_true)
-
-        return loss_values, loss_jacob
-
-    # ── GradNorm : norme du gradient d'une perte par rapport aux paramètres ──
-
-    @staticmethod
-    def _grad_norm(loss, params):
-        grads = torch.autograd.grad(loss, params, retain_graph=True, create_graph=True)
-        return torch.norm(torch.stack([g.norm() for g in grads if g is not None]))
-
-    # ── Training phase ────────────────────────────────────────────────────────
-
-    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
-        model.train()
-        totalLoss        = 0.0
-        totalLossValues  = 0.0
-        totalLossJacob   = 0.0
-
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
-            self.stats.lr.append(optimizer.param_groups[0]['lr'])
-
-            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-            # --- Termes bruts ---
-            loss_values, loss_jacob = self._compute_losses(model, batch_X, batch_Y, batch_J)
-
-            # --- Poids softmax ---
-            weights = torch.softmax(self.taskWeights, dim=0)
-            weighted_lv = weights[0] * loss_values
-            weighted_lj = weights[1] * loss_jacob
-            loss = weighted_lv + weighted_lj
-
-            # --- GradNorm ---
-            shared_params = [p for p in model.parameters() if p.requires_grad]
-
-            G1 = self._grad_norm(weighted_lv, shared_params)
-            G2 = self._grad_norm(weighted_lj, shared_params)
-            G_avg = (G1 + G2) / 2.0
-
-            r1, r2 = self._update_ema(loss_values, loss_jacob)
-
-            grad_loss = (
-                torch.abs(G1 - G_avg * (r1 ** self.alpha)) +
-                torch.abs(G2 - G_avg * (r2 ** self.alpha))
-            )
-
-            # Mise à jour des poids de tâche
-            self.weightOptimizer.zero_grad()
-            grad_loss.backward(retain_graph=True)
-            self.weightOptimizer.step()
-
-            # Renormalisation des poids (convention GradNorm)
-            with torch.no_grad():
-                self.taskWeights.data = (
-                    self.taskWeights.data.relu() /
-                    (self.taskWeights.data.relu().sum() + 1e-8) * 2
-                )
-
-            # Mise à jour du modèle
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            lrScheduler.step()
-
-            n = batch_X.data.size(0)
-            totalLoss       += loss.item()       * n
-            totalLossValues += loss_values.item() * n
-            totalLossJacob  += loss_jacob.item()  * n
-
-        N = X.nSamples
-        totalLoss       /= N
-        totalLossValues /= N
-        totalLossJacob  /= N
-
-        self.stats.loss.append(totalLoss)
-        return totalLoss, totalLossValues, totalLossJacob
-
-    # ── Validation phase ──────────────────────────────────────────────────────
-
-    def __validationPhase(self, Xval, Yval, model, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss  = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-        return totalLoss
-
-    # ── Point d'entrée public ─────────────────────────────────────────────────
+        return totalLoss, totalLV, totalLJ
 
     def train(self, X, Y, J_X, model):
         torch.cuda.empty_cache()
@@ -387,61 +89,154 @@ class DirectionalGradNormSobolevTrainer(_statsSave):
         X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
 
         model.to(self.trainingDevice).to(self.trainingDtype)
+        optimizer, lrScheduler = self._build_optimizer(model)
 
-        # Initialisation des poids GradNorm (sur le bon device)
-        self.taskWeights = nn.Parameter(
-            torch.ones(2, device=self.trainingDevice, dtype=self.trainingDtype)
-        )
-        self.weightOptimizer = torch.optim.Adam([self.taskWeights], lr=self.gradnormLr)
-        self.emaValues = None
-        self.emaJacob  = None
-
-        optimizer   = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
-        lossFunc    = nn.MSELoss()
+        self.stats.ranks.append(self.compute_effective_ranks(model))
 
         for epoch in range(self.epochs):
             trainLoss, lv, lj = self.__trainingPhase(
                 X_train, Y_train, J_train, model, optimizer, lrScheduler
             )
-            valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
+            valLoss, jacobianValLoss = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
+            self.stats.ranks.append(self.compute_effective_ranks(model))
 
-            weights = torch.softmax(self.taskWeights, dim=0).detach()
-            current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"[{epoch + 1}/{self.epochs}] "
                 f"Train: {self._format_loss(trainLoss)}"
                 f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
-                f"Val MSE: {self._format_loss(valLoss)}  |  "
-                f"w_val: {weights[0]:.3f}  w_jac: {weights[1]:.3f}  |  "
-                f"LR: {current_lr:.2e}"
+                f"Val: (mse: {self._format_loss(valLoss)}, jacobian: {self._format_loss(jacobianValLoss)})  |  "
+                f"λ_val: {1 - self.lmbda:.3f}  λ_jac: {self.lmbda:.3f}  |  "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
 
 
 
-class SobolevTrainer(_statsSave):
+# ─────────────────────────────────────────────────────────────────────────────
+class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, EffectiveRankMixin):
     """
-    Sobolev Training — Czarnecki et al., 2017  (https://arxiv.org/abs/1706.04859)
+    Directional Sobolev training with fixed λ weighting.
 
-    Loss:
-        L(θ) = (1/N) Σ_i  ‖f(xᵢ) − m(xᵢ|θ)‖²
-                         + ‖∇_x f(xᵢ) − ∇_x m(xᵢ|θ)‖²
-
-    Les deux termes ont le même poids (pas de λ), conformément à l'article.
-    Les jacobiennes sont complètes (shape: N × d_out × d_in) et calculées en X.
+    loss = (1 - λ) * MSE(values) + λ * MSE(J·v)   with v = Y - X
     """
 
     def __init__(
-        self,
-        testSize=0.25,
-        lr=5e-3,
-        warmupSteps=2000,
-        decayRate=0.92,
-        decaySteps=1500,
-        epochs=50,
-        batchSize=128,
-        trainingDevice=None,
-        trainingDtype=None,
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            lmbda=0.5,
+            alpha=None
+    ):
+        _statsSave.__init__(self)
+        if not 0.0 <= lmbda <= 1.0:
+            raise ValueError("lmbda must be in [0, 1]")
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+        self.lmbda = lmbda
+        self.alpha = alpha
+
+    def __trainingPhase(self, X, Y, target_jacobians, model, pc_optimizer, lrScheduler):
+        model.train()
+        totalLoss = totalLV = totalLJ = 0.0
+
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(pc_optimizer.param_groups[0]['lr'])
+
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+            if self.alpha is None:
+                lv, lj = directional_sobolev_losses(model, bX, bY, bJ)
+            else:
+                lv, lj = directional_sobolev_losses_cone(model, bX, bY, bJ, alpha=self.alpha)
+
+            weighted_lv = (1.0 - self.lmbda) * lv
+            weighted_lj = self.lmbda * lj
+
+            pc_optimizer.pc_backward([weighted_lv, weighted_lj])
+
+            #nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            pc_optimizer.step()
+            lrScheduler.step()
+
+            n = bX.data.size(0)
+            loss_val = weighted_lv.item() + weighted_lj.item()
+            totalLoss += loss_val * n
+            totalLV += lv.item() * n
+            totalLJ += lj.item() * n
+
+        N = X.nSamples
+        totalLoss /= N;
+        totalLV /= N;
+        totalLJ /= N
+        self.stats.loss.append(totalLoss)
+        return totalLoss, totalLV, totalLJ
+
+    def train(self, X, Y, J_X, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+        base_optimizer, lrScheduler = self._build_optimizer(model)
+        pc_optimizer = PCGradMixin(base_optimizer)
+
+        self.stats.ranks.append(self.compute_effective_ranks(model))
+
+        for epoch in range(self.epochs):
+            trainLoss, lv, lj = self.__trainingPhase(
+                X_train, Y_train, J_train, model, pc_optimizer, lrScheduler
+            )
+            valLoss, jacobianValLoss = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
+            self.stats.ranks.append(self.compute_effective_ranks(model))
+
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}"
+                f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"Val: (mse: {self._format_loss(valLoss)}, jacobian: {self._format_loss(jacobianValLoss)})  |  "
+                f"λ_val: {1 - self.lmbda:.3f}  λ_jac: {self.lmbda:.3f}  |  "
+                f"LR: {pc_optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class DirectionalGradNormSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin, _statsSave):
+    """
+    Directional Sobolev training with GradNorm automatic weight balancing.
+    """
+
+    def __init__(
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            alpha=0.5,
+            gradnormLr=1e-3,
+            emaBeta=0.99,
     ):
         _statsSave.__init__(self)
         self.testSize = testSize
@@ -453,124 +248,124 @@ class SobolevTrainer(_statsSave):
         self.batchSize = batchSize
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
+        self._gn_alpha_init = alpha
+        self._gn_lr = gradnormLr
+        self._gn_beta = emaBeta
 
-    # ── LR schedule (identique à JVPTrainer) ─────────────────────────────────
+    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+        model.train()
+        totalLoss = totalLV = totalLJ = 0.0
 
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-    # ── Train / test split (identique à JVPTrainer) ──────────────────────────
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
-    def trainTestSplit(self, X, Y, J):
-        if X.nSamples != Y.nSamples or J.nSamples != X.nSamples:
-            raise ValueError("X, Y and J must have the same number of samples")
+            lv, lj = directional_sobolev_losses(model, bX, bY, bJ)
+
+            weights = self._softmax_weights()
+            wLV = weights[0] * lv
+            wLJ = weights[1] * lj
+
+            loss = self._gradnorm_step(optimizer, [wLV, wLJ], [lv, lj], model, clip_grad=1.0)
+            lrScheduler.step()
+
+            n = bX.data.size(0)
+            totalLoss += loss.item() * n
+            totalLV += lv.item() * n
+            totalLJ += lj.item() * n
 
         N = X.nSamples
-        n_test = int(N * self.testSize)
-        indices = torch.randperm(N)
+        totalLoss /= N;
+        totalLV /= N;
+        totalLJ /= N
+        self.stats.loss.append(totalLoss)
+        return totalLoss, totalLV, totalLJ
 
-        test_idx  = indices[:n_test]
-        train_idx = indices[n_test:]
+    def train(self, X, Y, J_X, model):
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        return (
-            X[train_idx].contiguous(), X[test_idx].contiguous(),
-            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
-            J[train_idx].contiguous(), J[test_idx].contiguous(),
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+        self._init_gradnorm(
+            n_tasks=2,
+            device=self.trainingDevice,
+            dtype=self.trainingDtype,
+            lr=self._gn_lr,
+            alpha=self._gn_alpha_init,
+            ema_beta=self._gn_beta,
         )
+        optimizer, lrScheduler = self._build_optimizer(model)
 
-    # ── Sobolev loss ─────────────────────────────────────────────────────────
+        for epoch in range(self.epochs):
+            trainLoss, lv, lj = self.__trainingPhase(
+                X_train, Y_train, J_train, model, optimizer, lrScheduler
+            )
+            valLoss = self._validation_phase(X_val, Y_val, model)
+            weights = self._softmax_weights().detach()
 
-    @staticmethod
-    def sobolev_loss(model, batch_X, batch_Y, target_jacobians, jacobianScaler):
-        """
-        Calcule la loss de Sobolev exacte du papier.
-
-        Args:
-            model             : le réseau neuronal
-            batch_X           : (N, d_in)  — points d'évaluation
-            batch_Y           : (N, d_out) — valeurs cibles  f(xᵢ)
-            target_jacobians  : (N, d_out, d_in) — jacobiennes cibles  ∇_x f(xᵢ)
-
-        Returns:
-            loss_value   : scalaire
-            loss_value_term  : MSE valeurs (pour logging)
-            loss_jacob_term  : MSE jacobiennes (pour logging)
-        """
-        # ── Terme 1 : MSE sur les valeurs ─────────────────────────────────
-        preds = model(batch_X)             # (N, d_out)
-        loss_values = nn.functional.mse_loss(preds.data, batch_Y.data)
-
-        # ── Terme 2 : MSE sur les jacobiennes complètes ───────────────────
-        # On a besoin du gradient par rapport à x → requires_grad sur x
-        x = batch_X.data.detach().requires_grad_(True)       # (N, d_in)
-
-        def model_fn(single_x):
-            """Appliqué sample par sample via vmap."""
-            return model(single_x.unsqueeze(0), tensorInput=True).squeeze(0)
-
-        # jacrev calcule la jacobienne complète d_out × d_in pour un seul x
-        # vmap vectorise sur le batch  →  (N, d_out, d_in)
-        batch_jacobian_fn = vmap(jacrev(model_fn))
-        pred_jacobians = batch_jacobian_fn(x)                # (N, d_out, d_in)
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}"
+                f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"Val MSE: {self._format_loss(valLoss)}  |  "
+                f"w_val: {weights[0]:.3f}  w_jac: {weights[1]:.3f}  |  "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
 
-        #print("Unscaled pred", torch.isnan(pred_jacobians).any())  # dans sobolev_loss
-        #print("Unscaled true" , torch.isnan(target_jacobians.data).any())  # idem
+# ─────────────────────────────────────────────────────────────────────────────
+class SobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
+    """
+    Full Sobolev training — Czarnecki et al., 2017.
 
-        #scaled_pred_jacobian = jacobianScaler.transformTorch(pred_jacobians)
-        #scaled_target_jacobian = jacobianScaler.transformTorch(target_jacobians.data)
+    loss = λ * MSE(values) + (1-λ) * MSE(J·v)
 
-        #print("scaled pred", torch.isnan(scaled_pred_jacobian).any())  # dans sobolev_loss
-        #print("scaled true" , torch.isnan(scaled_target_jacobian.data).any())  # idem
+    Jacobians are full (N, d_out, d_in) and pre-computed at X.
+    The direction v = Y - X is used for the directional JVP.
+    """
 
-        #loss_jacobians = nn.functional.mse_loss(scaled_pred_jacobian, scaled_target_jacobian)
-        #loss_jacobians = nn.functional.mse_loss(pred_jacobians, target_jacobians.data)  # unscaled jacobian
-
-        v = batch_Y.data - batch_X.data
-        #print(v.norm(dim=1, keepdim=True))
-        #v = v / v.norm(dim=1, keepdim=True)
-        # TODO: scaling to prevent that samples with huge Y-X (combustion zone) are more represented in the loss. If we do not normalize, the training is unstable and we can see that the combustion zone is musch more refined
-        #  whene not scaled, the validation loss approximately folows the the jacobian loss but whene scaled it is not the case at all, it is quite the oposite
-        #  however, whene scaling the v, minimizing Jloss increases mse and oposite. the behaviour completlly changes
-        v_expanded = v.unsqueeze(2)
-        Jv_pred = torch.bmm(pred_jacobians, v_expanded)
-        Jv_true = torch.bmm(target_jacobians.data, v_expanded)
-        # enlever la dernière dimension → (N, d_out)
-        Jv_pred = Jv_pred.squeeze(2)
-        Jv_true = Jv_true.squeeze(2)
-
-        # loss
-        loss_jacobians = nn.functional.mse_loss(Jv_pred, Jv_true)
-        # TODO: we can see the directional jvp loss is diminishing even when not constrained, while the loss on the full jacobian diminishes slightly but nearly not.
-        #  It could be interesting to define v as a vector of norm Y - X but with a direction slightly different (within a cone) so that the network can learn the jacobian slightly outside the direction of the manifold
-        #  or we could define v = X - really small perturbation on X so that the network learns the impact of an error, but it is close to stochastic sobolev learning and it is surelly not stable.
-        #  Thus, perturbing the direction of Y-X is the preferd piste of recherche
-
-        # ── Loss totale (poids égaux, comme dans le papier) ───────────────
-        lamb = 1
-        loss = lamb * loss_values + (1-lamb) * loss_jacobians
-
-        return loss, loss_values.detach(), loss_jacobians.detach()
-
-    # ── Training phase ────────────────────────────────────────────────────────
+    def __init__(
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            lamb=1.0,
+    ):
+        _statsSave.__init__(self)
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+        self.lamb = lamb
 
     def __trainingPhase(self, X, Y, target_jacobians, jacobianScaler, model, optimizer, lrScheduler):
         model.train()
-        totalLoss        = 0.0
-        totalLossValues  = 0.0
-        totalLossJacob   = 0.0
+        totalLoss = totalLV = totalLJ = 0.0
 
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_J = target_jacobians[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            # batch_J : (B, d_out, d_in) — jacobiennes cibles ∇_x f(xᵢ)
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
-            loss, lv, lj = self.sobolev_loss(model, batch_X, batch_Y, batch_J, jacobianScaler)
+            loss, lv, lj = full_sobolev_loss(model, bX, bY, bJ, lamb=self.lamb)
 
             optimizer.zero_grad()
             loss.backward()
@@ -578,215 +373,323 @@ class SobolevTrainer(_statsSave):
             optimizer.step()
             lrScheduler.step()
 
-            n = batch_X.data.size(0)
-            totalLoss       += loss.item() * n
-            totalLossValues += lv.item()   * n
-            totalLossJacob  += lj.item()   * n
+            n = bX.data.size(0)
+            totalLoss += loss.item() * n
+            totalLV += lv.item() * n
+            totalLJ += lj.item() * n
 
         N = X.nSamples
-        totalLoss       /= N
-        totalLossValues /= N
-        totalLossJacob  /= N
-
+        totalLoss /= N;
+        totalLV /= N;
+        totalLJ /= N
         self.stats.loss.append(totalLoss)
-        return totalLoss, totalLossValues, totalLossJacob
+        return totalLoss, totalLV, totalLJ
 
-    # ── Validation phase ──────────────────────────────────────────────────────
-
-    def __validationPhase(self, Xval, Yval, model, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss  = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-        return totalLoss
-
-    # ── Point d'entrée public ─────────────────────────────────────────────────
-
-    def train(self, X, Y, J_X, model, jacobianScaler):
-        """
-        Args:
-            X                 : dataset d'entrées
-            Y                 : dataset de valeurs cibles  f(xᵢ)
-            target_jacobians  : Tensor (N, d_out, d_in) — ∇_x f(xᵢ) pour tout i
-            model             : le réseau neuronal
-        """
+    def train(self, X, Y, J_X, model, jacobianScaler=None):
         torch.cuda.empty_cache()
         gc.collect()
 
-        # Split — on splitte X, Y et les jacobiennes avec les mêmes indices
         X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
 
         model.to(self.trainingDevice).to(self.trainingDtype)
-
-        optimizer    = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler  = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
-        lossFunc     = nn.MSELoss()
+        optimizer, lrScheduler = self._build_optimizer(model)
 
         for epoch in range(self.epochs):
             trainLoss, lv, lj = self.__trainingPhase(
                 X_train, Y_train, J_train, jacobianScaler, model, optimizer, lrScheduler
             )
-            valLoss = self.__validationPhase(X_val, Y_val, model, lossFunc)
+            valLoss = self._validation_phase(X_val, Y_val, model)
 
-            current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"[{epoch + 1}/{self.epochs}] "
                 f"Train: {self._format_loss(trainLoss)}"
-                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)}  |  "
+                f"  (val: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
                 f"Val MSE: {self._format_loss(valLoss)}  |  "
-                f"LR: {current_lr:.2e}"
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+class integratorSurogateTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
+    """
+    Integrator surrogate trainer.
 
-class JVPTrainer(_statsSave):
-    def __init__(self, testSize=0.25, lr=5e-3, warmupSteps=2000, decayRate=0.92, decaySteps=1500, epochs=50, batchSize=128, trainingDevice=None, trainingDtype=None):
+    Combines MSE on function values with a Jacobian inverse consistency loss:
+        loss = MSE(pred, Y) + jac_inv_loss(J_pred, J_1) / scale
+
+    The jac_inv_loss enforces J_model ≈ J_true^{-1}.
+    """
+
+    def __init__(
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            jacLossScale=430,
+    ):
         _statsSave.__init__(self)
         self.testSize = testSize
         self.lr = lr
         self.warmupSteps = warmupSteps
         self.decayRate = decayRate
         self.decaySteps = decaySteps
-
         self.epochs = epochs
         self.batchSize = batchSize
-
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
+        self.jacLossScale = jacLossScale
 
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
-
-    def trainTestSplit(self, X, Y):
-        if X.nSamples != Y.nSamples:
-            raise ValueError("X and Y must have the same number of samples")
-
-        N = X.nSamples
-        n_test = int(N * self.testSize)
-
-        indices = torch.arange(N)
-        indices = indices[torch.randperm(N)]
-
-        test_idx = indices[:n_test]
-        train_idx = indices[n_test:]
-
-        X_train = X[train_idx].contiguous()
-        X_test = X[test_idx].contiguous()
-        Y_train = Y[train_idx].contiguous()
-        Y_test = Y[test_idx].contiguous()
-
-        return X_train, X_test, Y_train, Y_test
-
-    @staticmethod
-    def physics_loss_jvp(model, Y, preds):
-        # ── JVP du réseau dans l'espace normalisé ─────────────────────────
-        def model_fn(x):
-            return model(x, tensorInput=True)
-
-        _, Jv_network = torch.func.jvp(
-            model_fn,
-            (Y.data,),
-            (preds.data - Y.data,)
-        )  # (N, d)
-
-        return (Jv_network ** 2).mean()
-
-    def __trainingPhase(self, X, Y, model, optimizer, lrScheduler):
+    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
         model.train()
-        totalLoss = 0
+        totalLoss = totalLJ = totalLV = 0.0
 
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-            batch_X = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
-            # ── Loss données ───────────────────────────────────────────────
-            preds = model(batch_X)
+            lj = jac_inv_loss(model, bX, bJ) / self.jacLossScale
 
-            # ── Loss physique ──────────────────────────────────────────────
-            loss = self.physics_loss_jvp(model, batch_Y, preds) + nn.MSELoss()(preds.data, batch_Y.data)
+            preds = model(bX)
+            lv = nn.functional.mse_loss(bY.data, preds.data)
+
+            loss = lj + lv
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             lrScheduler.step()
 
-            totalLoss += loss.item() * batch_X.data.size(0)
-            #print(loss.item(), lossData.item(), lambdaPhysics * lossPhysics.item())
+            n = bX.data.size(0)
+            totalLoss += loss.item() * n
+            totalLJ += lj.item() * n
+            totalLV += lv.item() * n
+
+        N = X.nSamples
+        totalLoss /= N;
+        totalLJ /= N;
+        totalLV /= N
+        self.stats.loss.append(totalLoss)
+        return totalLoss, totalLJ, totalLV
+
+    def train(self, X, Y, J_1, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_1)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+        optimizer, lrScheduler = self._build_optimizer(model)
+
+        for epoch in range(self.epochs):
+            trainLoss, lj, lv = self.__trainingPhase(
+                X_train, Y_train, J_train, model, optimizer, lrScheduler
+            )
+            valLoss = self._validation_phase(X_val, Y_val, model)
+
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}"
+                f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
+                f"Val MSE: {self._format_loss(valLoss)}  |  "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+
+from POLENE_GPU.NN.trainer._statsSave import _statsSave
+from POLENE_GPU.NN.trainer._mixins import SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin
+from POLENE_GPU.NN.trainer._losses import jvp_physics_loss
+
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+import gc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, EffectiveRankMixin):
+
+    def __init__(
+            self,
+            testSize=0.25,
+            lr=5e-3,
+            warmupSteps=2000,
+            decayRate=0.92,
+            decaySteps=1500,
+            epochs=50,
+            batchSize=128,
+            trainingDevice=None,
+            trainingDtype=None,
+            alpha=None
+    ):
+        _statsSave.__init__(self)
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+        self.alpha = alpha
+
+    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+        model.train()
+        totalLoss = 0.0
+
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(optimizer.param_groups[0]['lr'])
+
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+            if self.alpha is None:
+                loss = manifoldJacobianLoss(model, bX, bY, bJ)
+            else:
+                loss = manifoldJacobianLoss_cone(model, bX, bY, bJ, self.alpha)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            lrScheduler.step()
+
+            n = bX.data.size(0)
+            totalLoss += loss.item() * n
+
+
+        N = X.nSamples
+        totalLoss /= N
+        self.stats.loss.append(totalLoss)
+        return totalLoss
+
+    def train(self, X, Y, J_X, model):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+
+        model.to(self.trainingDevice).to(self.trainingDtype)
+        optimizer, lrScheduler = self._build_optimizer(model)
+
+        self.stats.ranks.append(self.compute_effective_ranks(model))
+
+        for epoch in range(self.epochs):
+            trainLoss = self.__trainingPhase(
+                X_train, Y_train, J_train, model, optimizer, lrScheduler
+            )
+            valLoss, valLossJac = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
+            self.stats.ranks.append(self.compute_effective_ranks(model))
+
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train: {self._format_loss(trainLoss)}  |  "
+                f"Val: (mse: {self._format_loss(valLoss)}, jacobian: {self._format_loss(valLossJac)})  |  "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class dataJVPTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
+    """
+    Trains purely on the directional Jacobian loss (no MSE on values):
+
+        loss = MSE( J_network(X)·(Y-X),  J_true·(Y-X) )
+
+    Uses pre-computed Jacobians J_true at X.
+    Validation is still evaluated with MSE on predictions.
+    """
+
+    def __init__(
+        self,
+        testSize=0.25,
+        lr=5e-3,
+        warmupSteps=2000,
+        decayRate=0.92,
+        decaySteps=1500,
+        epochs=50,
+        batchSize=128,
+        trainingDevice=None,
+        trainingDtype=None,
+    ):
+        _statsSave.__init__(self)
+        self.testSize = testSize
+        self.lr = lr
+        self.warmupSteps = warmupSteps
+        self.decayRate = decayRate
+        self.decaySteps = decaySteps
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.trainingDevice = trainingDevice
+        self.trainingDtype = trainingDtype
+
+    def __trainingPhase(self, X, Y, J_Y, model, optimizer, lrScheduler):
+        model.train()
+        totalLoss = 0.0
+
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
+            self.stats.lr.append(optimizer.param_groups[0]['lr'])
+
+            bX  = X  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY  = Y  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJY = J_Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+
+            loss = jvp_physics_loss(model, bX, bY, bJY)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            lrScheduler.step()
+
+            totalLoss += loss.item() * bX.data.size(0)
 
         totalLoss /= X.nSamples
         self.stats.loss.append(totalLoss)
         return totalLoss
 
-
-    def __validationPhase(self, Xval, Yval, model, optimizer, lrScheduler, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-
-        return totalLoss
-
-
-    def train(self, X, Y, model):
+    def train(self, X, Y, J_Y, model):
         torch.cuda.empty_cache()
         gc.collect()
 
-        X, Xval, Y, Yval = self.trainTestSplit(X, Y)
-        #  data is already shuffled.
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_Y)
 
         model.to(self.trainingDevice).to(self.trainingDtype)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[self.warmup_exp_decay])
-        lossFunc = nn.MSELoss()
+        optimizer, lrScheduler = self._build_optimizer(model)
 
         for epoch in range(self.epochs):
+            trainLoss = self.__trainingPhase(X_train, Y_train, J_train, model, optimizer, lrScheduler)
+            valLoss   = self._validation_phase(X_val, Y_val, model)
 
-            trainingLoss = self.__trainingPhase(X, Y, model, optimizer, lrScheduler)
-            validationLoss = self.__validationPhase(Xval, Yval, model, optimizer, lrScheduler, lossFunc)
-
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"[{epoch + 1}/{self.epochs}] "
-                  f"Train: {self._format_loss(trainingLoss)}  |  "
-                  f"Val: {self._format_loss(validationLoss)}  |  "
-                  f"LR: {current_lr:.2e}")
+            print(
+                f"[{epoch + 1}/{self.epochs}] "
+                f"Train (jac mse): {self._format_loss(trainLoss)}  |  "
+                f"Val (pred mse): {self._format_loss(valLoss)}  |  "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
 
-class JacobianGradNormTrainer(_statsSave):
+# ─────────────────────────────────────────────────────────────────────────────
+class JacobianGradNormTrainer(SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin, _statsSave):
     """
-    Minimise deux objectifs via GradNorm :
-      - L_mse  = MSE(pred, Y)
-      - L_jac  = ||J_pred·δ − J_true·δ||²   avec δ = pred − Y
-                 J_pred est la jacobienne autograd du réseau (via JVP)
-                 J_true est la jacobienne physique fournie par le dataset
+    MSE + directional Jacobian consistency loss, balanced via GradNorm.
 
-    Les poids w1, w2 sont appris via GradNorm + EMA des ratios de loss.
+    Jacobian loss:
+        ||J_network(Y)·δ  −  J_true·δ||^2   with δ = Y - pred
+
+    J_network·δ is obtained via JVP without building the full Jacobian.
+
+    Note: this trainer showed limited improvement over plain MSE when the
+    linearisation error is studied around the network prediction error.
+    Kept for research purposes.
     """
-    # This trainer does not really work whene we study the linearisation error around the network prediction error. It is not improved compared to a traditional network
 
     def __init__(
         self,
@@ -794,6 +697,7 @@ class JacobianGradNormTrainer(_statsSave):
         lossWeightJac=1.0e-4,
         emaBeta=0.99,
         gradNormAlpha=0.5,
+        gradNormLr=1e-3,
         lr=5e-3,
         warmupSteps=2000,
         decayRate=0.92,
@@ -813,369 +717,92 @@ class JacobianGradNormTrainer(_statsSave):
         self.batchSize = batchSize
         self.trainingDevice = trainingDevice
         self.trainingDtype = trainingDtype
-
-        self.lossWeightJac = lossWeightJac   # prefacteur initial sur L_jac avant normalisation GradNorm
-        self.alpha = gradNormAlpha
-
-        # Poids apprenables pour GradNorm
-        self.taskWeights = torch.nn.Parameter(
-            torch.ones(2, device=self.trainingDevice)
-        )
-        self.weightOptimizer = torch.optim.Adam([self.taskWeights], lr=1e-3)
-
-        # EMA pour estimer le taux de progrès relatif de chaque tâche
-        self.emaBeta = emaBeta
-        self.emaMse = None
-        self.emaJac = None
-
-    # ─────────────────────────────────────────────────────────────── scheduler
-
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
-
-    # ──────────────────────────────────────────────────────────────── split
-
-    def trainTestSplit(self, X, Y, J):
-        if X.nSamples != Y.nSamples or X.nSamples != J.nSamples:
-            raise ValueError("X, Y et J doivent avoir le même nombre d'échantillons")
-
-        N = X.nSamples
-        n_test = int(N * self.testSize)
-        indices = torch.randperm(N)
-        test_idx = indices[:n_test]
-        train_idx = indices[n_test:]
-
-        return (
-            X[train_idx].contiguous(), X[test_idx].contiguous(),
-            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
-            J[train_idx].contiguous(), J[test_idx].contiguous(),
-        )
-
-    # ──────────────────────────────────────────────────────────── loss jacobienne
+        self.lossWeightJac = lossWeightJac
+        self._gn_alpha_init = gradNormAlpha
+        self._gn_lr = gradNormLr
+        self._gn_beta = emaBeta
 
     @staticmethod
-    def jacobian_consistency_loss(model, preds, Y, J_true):
+    def _jacobian_consistency_loss(
+        model,
+        preds: torch.Tensor,
+        Y: torch.Tensor,
+        J_true: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Calcule ||J_pred·δ − J_true·δ||²  avec δ = pred − Y.
-
-        J_pred·δ  est obtenu par JVP (produit jacobien-vecteur sans
-        construire la jacobienne entière).
-        J_true·δ  est un simple bmm.
-
-        Args:
-            model   : le réseau (appelé via tensorInput=True)
-            preds   : sortie du modèle  (N, d_out)  – avec .data attribut
-            Y       : cibles             (N, d_out)
-            J_true  : jacobienne vraie   (N, d_out, d_in)  – NB: J @ δ_in
-                      Si J_true est de shape (N, d, d) (carré), on l'utilise
-                      directement comme opérateur linéaire sur δ_out.
+        ||J_network(Y)·δ  −  J_true·δ||^2   with δ = Y - pred.
+        J_network·δ via JVP, J_true·δ via bmm.
         """
-        delta = Y.data - preds.data            # (N, d)
+        delta = Y.data - preds.data            # (B, d)
 
-        # ── J_pred · δ  via JVP ────────────────────────────────────────────
         def model_fn(x):
             return model(x, tensorInput=True)
 
-        _, Jv_pred = torch.func.jvp(
-            model_fn,
-            (Y.data,),
-            (delta,),
-        )                                        # (N, d_out)
-
-        # ── J_true · δ  via bmm ────────────────────────────────────────────
-        # J_true : (N, d_out, d_in) ;  delta : (N, d_in)
-        delta_col = delta.unsqueeze(-1)          # (N, d, 1)
-        Jv_true = torch.bmm(J_true, delta_col).squeeze(-1)  # (N, d_out)
-
+        _, Jv_pred = torch.func.jvp(model_fn, (Y.data,), (delta,))
+        Jv_true = torch.bmm(J_true, delta.unsqueeze(-1)).squeeze(-1)
         return ((Jv_pred - Jv_true) ** 2).mean()
-
-    # ──────────────────────────────────────────────────────────────── GradNorm
-
-    @staticmethod
-    def _grad_norm(loss, params):
-        grads = torch.autograd.grad(
-            loss, params, retain_graph=True, create_graph=True
-        )
-        return torch.norm(
-            torch.stack([g.norm() for g in grads if g is not None])
-        )
-
-    def _update_ema(self, mse_val, jac_val):
-        mse = mse_val.detach()
-        jac = jac_val.detach()
-        if self.emaMse is None:
-            self.emaMse, self.emaJac = mse, jac
-        else:
-            b = self.emaBeta
-            self.emaMse = b * self.emaMse + (1 - b) * mse
-            self.emaJac = b * self.emaJac + (1 - b) * jac
-        mean = (self.emaMse + self.emaJac) / 2.0 + 1e-12
-        return self.emaMse / mean, self.emaJac / mean
-
-    # ──────────────────────────────────────────────────────── training phase
 
     def __trainingPhase(self, X, Y, J_Y, model, optimizer, lrScheduler):
         model.train()
-        totalLoss = 0.0
-        totalMse = 0.0
-        totalJac = 0.0
+        totalLoss = totalMSE = totalJac = 0.0
 
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
+        for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-            batch_X   = X  [batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y   = Y  [batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_J_Y = J_Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bX  = X  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bY  = Y  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bJY = J_Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
-            preds = model(batch_X)
+            preds = model(bX)
+            mseLoss = nn.functional.mse_loss(preds.data, bY.data)
+            jacLoss = self.lossWeightJac * self._jacobian_consistency_loss(model, preds, bY, bJY.data)
 
-            # ── losses individuelles ────────────────────────────────────────
-            mseLoss = nn.MSELoss()(preds.data, batch_Y.data)
-            jacLoss = self.lossWeightJac * self.jacobian_consistency_loss(
-                model, preds, batch_Y, batch_J_Y.data
-            )
+            weights = self._softmax_weights()
+            wMSE = weights[0] * mseLoss
+            wJac = weights[1] * jacLoss
 
-            # ── poids softmax ───────────────────────────────────────────────
-            weights = torch.softmax(self.taskWeights, dim=0)
-            weighted_mse = weights[0] * mseLoss
-            weighted_jac = weights[1] * jacLoss
-            loss = weighted_mse + weighted_jac
-
-            # ── GradNorm ────────────────────────────────────────────────────
-            shared_params = [p for p in model.parameters() if p.requires_grad]
-            G1 = self._grad_norm(weighted_mse, shared_params)
-            G2 = self._grad_norm(weighted_jac, shared_params)
-            G_avg = (G1 + G2) / 2.0
-
-            r1, r2 = self._update_ema(mseLoss, jacLoss)
-
-            grad_loss = (
-                torch.abs(G1 - G_avg * (r1 ** self.alpha)) +
-                torch.abs(G2 - G_avg * (r2 ** self.alpha))
-            )
-
-            self.weightOptimizer.zero_grad()
-            grad_loss.backward(retain_graph=True)
-            self.weightOptimizer.step()
-
-            # ── mise à jour du modèle ───────────────────────────────────────
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            loss = self._gradnorm_step(optimizer, [wMSE, wJac], [mseLoss, jacLoss], model)
             lrScheduler.step()
 
-            bs = batch_X.data.size(0)
-            totalLoss += loss.item()  * bs
-            totalMse  += mseLoss.item() * bs
-            totalJac  += jacLoss.item() * bs
+            n = bX.data.size(0)
+            totalLoss += loss.item()    * n
+            totalMSE  += mseLoss.item() * n
+            totalJac  += jacLoss.item() * n
 
         N = X.nSamples
-        totalLoss /= N;  totalMse /= N;  totalJac /= N
+        totalLoss /= N; totalMSE /= N; totalJac /= N
         self.stats.loss.append(totalLoss)
-        return totalLoss, totalMse, totalJac
-
-    # ─────────────────────────────────────────────────────── validation phase
-
-    def __validationPhase(self, Xval, Yval, model, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-        return totalLoss
-
-    # ──────────────────────────────────────────────────────────────── train
+        return totalLoss, totalMSE, totalJac
 
     def train(self, X, Y, J_Y, model):
         torch.cuda.empty_cache()
         gc.collect()
 
-        X, Xval, Y, Yval, J_Y, J_Y_val = self.trainTestSplit(X, Y, J_Y)
+        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_Y)
 
         model.to(self.trainingDevice).to(self.trainingDtype)
-
-        optimizer    = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler  = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=[self.warmup_exp_decay]
+        self._init_gradnorm(
+            n_tasks=2,
+            device=self.trainingDevice,
+            dtype=self.trainingDtype,
+            lr=self._gn_lr,
+            alpha=self._gn_alpha_init,
+            ema_beta=self._gn_beta,
         )
-        lossFunc = nn.MSELoss()
+        optimizer, lrScheduler = self._build_optimizer(model)
 
         for epoch in range(self.epochs):
             trainLoss, mseLoss, jacLoss = self.__trainingPhase(
-                X, Y, J_Y, model, optimizer, lrScheduler
+                X_train, Y_train, J_train, model, optimizer, lrScheduler
             )
-            valLoss = self.__validationPhase(Xval, Yval, model, lossFunc)
+            valLoss = self._validation_phase(X_val, Y_val, model)
+            weights = self._softmax_weights().detach()
 
-            w = torch.softmax(self.taskWeights, dim=0).detach()
-            current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"[{epoch + 1}/{self.epochs}] "
                 f"Train: {self._format_loss(trainLoss)}  "
                 f"(mse={self._format_loss(mseLoss)}, jac={self._format_loss(jacLoss)})  |  "
                 f"Val: {self._format_loss(valLoss)}  |  "
-                f"LR: {current_lr:.2e}  |  "
-                f"w_mse={w[0]:.3f}  w_jac={w[1]:.3f}"
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}  |  "
+                f"w_mse={weights[0]:.3f}  w_jac={weights[1]:.3f}"
             )
-
-class dataJVPTrainer(_statsSave):
-    def __init__(
-        self,
-        testSize=0.25,
-        lr=5e-3,
-        warmupSteps=2000,
-        decayRate=0.92,
-        decaySteps=1500,
-        epochs=50,
-        batchSize=128,
-        trainingDevice=None,
-        trainingDtype=None,
-    ):
-        _statsSave.__init__(self)
-        self.testSize = testSize
-        self.lr = lr
-        self.warmupSteps = warmupSteps
-        self.decayRate = decayRate
-        self.decaySteps = decaySteps
-        self.epochs = epochs
-        self.batchSize = batchSize
-        self.trainingDevice = trainingDevice
-        self.trainingDtype = trainingDtype
-
-    # ─────────────────────────────────────────────────────────────── scheduler
-
-    def warmup_exp_decay(self, k):
-        if self.warmupSteps > 0 and k < self.warmupSteps:
-            return (k + 1) / self.warmupSteps
-        return self.decayRate ** ((k - self.warmupSteps) / self.decaySteps)
-
-    # ──────────────────────────────────────────────────────────────── split
-
-    def trainTestSplit(self, X, Y, J):
-        if X.nSamples != Y.nSamples or X.nSamples != J.nSamples:
-            raise ValueError("X, Y et J doivent avoir le même nombre d'échantillons")
-
-        N = X.nSamples
-        n_test = int(N * self.testSize)
-        indices = torch.randperm(N)
-        test_idx = indices[:n_test]
-        train_idx = indices[n_test:]
-
-        return (
-            X[train_idx].contiguous(), X[test_idx].contiguous(),
-            Y[train_idx].contiguous(), Y[test_idx].contiguous(),
-            J[train_idx].contiguous(), J[test_idx].contiguous(),
-        )
-
-    # ──────────────────────────────────────────────────────────── loss jacobienne
-
-    @staticmethod
-    def physics_loss_jvp(model, X, Y, J_true):
-
-        DeltaX = (Y.data - X.data)
-
-        # ── JVP du réseau dans l'espace normalisé ─────────────────────────
-        def model_fn(x):
-            return model(x, tensorInput=True)
-
-        _, Jv_network = torch.func.jvp(
-            model_fn,
-            (X.data,),
-            (DeltaX,)
-        )  # (N, d)
-
-        Jv_true = torch.bmm(J_true.data, DeltaX.unsqueeze(-1))
-
-        return nn.MSELoss()(Jv_network, Jv_true.squeeze(-1))
-
-    # ──────────────────────────────────────────────────────── training phase
-
-    def __trainingPhase(self, X, Y, J_Y, model, optimizer, lrScheduler):
-        model.train()
-        totalLoss = 0.0
-
-        for batch in tqdm(range(0, X.nSamples, self.batchSize)):
-            self.stats.lr.append(optimizer.param_groups[0]['lr'])
-
-            batch_X   = X[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_Y   = Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            batch_J_Y = J_Y[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-            loss = self.physics_loss_jvp(model, batch_X, batch_Y, batch_J_Y)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lrScheduler.step()
-
-            totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= X.nSamples
-        self.stats.loss.append(totalLoss)
-        return totalLoss
-
-    # ─────────────────────────────────────────────────────── validation phase
-
-    def __validationPhase(self, Xval, Yval, model, lossFunc):
-        model.eval()
-        totalLoss = 0.0
-
-        with torch.no_grad():
-            for batch in range(0, Xval.nSamples, self.batchSize):
-                batch_X = Xval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                batch_Y = Yval[batch:batch + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-                preds = model(batch_X)
-                loss = lossFunc(preds.data, batch_Y.data)
-                totalLoss += loss.item() * batch_X.data.size(0)
-
-        totalLoss /= Xval.nSamples
-        self.stats.valLoss.append(totalLoss)
-        return totalLoss
-
-    # ──────────────────────────────────────────────────────────────── train
-
-    def train(self, X, Y, J_Y, model):
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        X, Xval, Y, Yval, J_Y, J_Y_val = self.trainTestSplit(X, Y, J_Y)
-
-        model.to(self.trainingDevice).to(self.trainingDtype)
-
-        optimizer   = torch.optim.Adam(model.parameters(), lr=self.lr)
-        lrScheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=[self.warmup_exp_decay]
-        )
-        lossFunc = nn.MSELoss()
-
-        for epoch in range(self.epochs):
-            trainLoss = self.__trainingPhase(X, Y, J_Y, model, optimizer, lrScheduler)
-            valLoss   = self.__validationPhase(Xval, Yval, model, lossFunc)
-
-            current_lr = optimizer.param_groups[0]['lr']
-            print(
-                f"[{epoch + 1}/{self.epochs}] "
-                f"Train (jac mse): {self._format_loss(trainLoss)}  |  "
-                f"Val (pred mse): {self._format_loss(valLoss)}  |  "
-                f"LR: {current_lr:.2e}"
-            )
-
-
-def flatten(grads):
-    return torch.cat([
-        g.reshape(-1) for g in grads if g is not None
-    ])
-
-# TODO: faire un trainer qui minimise ||J_pred(X-Y) - J_true(X-Y)||^2 afin d'entrainer la jacobienne dans le sens de la transformation. c'est proche des equations de
-#  l'integrateur implicite et ça permet d'apprendre la jacobienne de la tranfo, ce qui est assez important pour la généralisation.

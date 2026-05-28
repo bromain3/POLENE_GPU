@@ -170,18 +170,59 @@ class LossLandscape:
         )
 
     def plotLandscape(self, landscape, title=''):
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-        N = landscape.shape[0]
-        M = landscape.shape[1]
-        X = np.array([[j for j in range(M)] for _ in range(N)])
-        Y = np.array([[i for _ in range(M)] for i in range(N)])
-        surf = ax.plot_surface(
-            X, Y, np.log10(landscape + 1e-10),
-            cmap='coolwarm', edgecolor='none'
+        N, M = landscape.shape
+        X = np.arange(M)
+        Y = np.arange(N)
+        X, Y = np.meshgrid(X, Y)
+
+        Z = np.log10(landscape + 1e-10)
+
+        fig = plt.figure(figsize=(12, 5))
+
+        # --- Subplot 3D ---
+        ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+
+        surf = ax1.plot_surface(
+            X, Y, Z,
+            cmap='coolwarm',
+            edgecolor='none',
+            alpha=0.9
         )
-        plt.colorbar(surf, ax=ax)
-        if title:
-            ax.set_title(title)
+
+        # Contours projetés sur le plan Z minimum
+        z_offset = Z.min()
+        ax1.contour(
+            X, Y, Z,
+            zdir='z',
+            offset=z_offset,
+            cmap='coolwarm'
+        )
+
+        ax1.set_zlim(z_offset, Z.max())
+        ax1.set_title(f"{title} (3D)" if title else "3D Landscape")
+
+        fig.colorbar(surf, ax=ax1, shrink=0.5, aspect=10)
+
+        # --- Subplot 2D ---
+        ax2 = fig.add_subplot(1, 2, 2)
+
+        im = ax2.imshow(
+            Z,
+            cmap='coolwarm',
+            origin='lower',
+            aspect='auto'
+        )
+
+        # Ajout de contours 2D
+        ax2.contour(
+            X, Y, Z,
+            colors='black',
+            linewidths=0.5
+        )
+
+        ax2.set_title(f"{title} (2D projection)" if title else "2D Projection")
+
+        fig.colorbar(im, ax=ax2)
+
         plt.tight_layout()
         plt.show()

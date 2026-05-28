@@ -12,7 +12,7 @@ def phi2Y(phi):
     return (Y)
 
 class __canteraReactorGenerator:
-    def __init__(self, kinetics='gri30.yaml', dtcfd=1e-6, tmax=1e-3, equilibriumTolerance=1e-4, cstSamplingdt=False, samplingRange=None):
+    def __init__(self, kinetics='gri30.yaml', dtcfd=1e-6, tmax=1e-3, equilibriumTolerance=1e-4, cstSamplingdt=False, samplingRange=None, limitMaxTimeStep=True):
         self.cstSamplingdt = cstSamplingdt
         self.dtcfd = dtcfd
         self.tmax = tmax
@@ -26,6 +26,7 @@ class __canteraReactorGenerator:
         self.singleTrajFeaturesNames = 2 * [['T', 'P'] + list(ct.Solution(kinetics).species_names)] + 2 * [['t']]
         self.dtbTrajFeaturesNames = 2 * [['T', 'P'] + list(ct.Solution(kinetics).species_names)]
         self.samplingVariables = list(self.samplingRange.keys())
+        self.limitMaxTimeStep = limitMaxTimeStep
 
     def _computeEquilibriumT(self, T, P, Y, reactorType):
         gas = ct.Solution(self.kinetics)
@@ -39,7 +40,7 @@ class __canteraReactorGenerator:
 
         featuresReactor = reactorType(gas)
         featuresNet = ct.ReactorNet([featuresReactor])
-        if not self.cstSamplingdt:
+        if not self.cstSamplingdt and self.limitMaxTimeStep:
             featuresNet.max_time_step = self.dtcfd #TODO: activating and deactivating it to show the difference in post combustion part of the trajcetory
 
         X = []

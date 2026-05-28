@@ -1,5 +1,6 @@
 import torch
 import matplotlib.pyplot as plt
+import numpy as np
 
 from POLENE_GPU.NN.validator._commonValidator import _commonValidator
 
@@ -20,8 +21,37 @@ class oneStepPredictionValidator(_commonValidator):
         #self.printStats(perColStats, globalStats)
 
         for col in X.colName:
-            plt.plot(tX['t'].cpu().detach().numpy(), preds[col].cpu().detach().numpy(), label='prediction', color='red', linestyle='--')
-            plt.plot(tX['t'].cpu().detach().numpy(), Y[col].cpu().detach().numpy(), label='target', color='blue')
-            plt.legend()
-            plt.title(col)
+            fig, axs = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+            t = tX['t'].cpu().detach().numpy()
+            pred = preds[col].cpu().detach().numpy()
+            target = Y[col].cpu().detach().numpy()
+
+            # =========================
+            # Plot linéaire
+            # =========================
+            axs[0].plot(t, pred, label='prediction', color='red', linestyle='--')
+
+            axs[0].plot(t, target, label='target', color='blue')
+
+            axs[0].set_title(f"{col} (linear scale)")
+            axs[0].legend()
+            axs[0].grid(True)
+
+            # =========================
+            # Plot logarithmique
+            # =========================
+            eps = 1e-30  # évite log(0)
+
+            axs[1].semilogy(t, np.abs(pred) + eps, label='prediction', color='red', linestyle='--')
+
+            axs[1].semilogy(t, np.abs(target) + eps, label='target', color='blue')
+
+            axs[1].set_title(f"{col} (log scale)")
+            axs[1].legend()
+            axs[1].grid(True)
+
+            axs[1].set_xlabel("t")
+
+            plt.tight_layout()
             plt.show()

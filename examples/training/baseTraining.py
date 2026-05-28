@@ -2,11 +2,14 @@ import POLENE_GPU.databaseGeneration.models.cantera0D as cantera0D
 import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
+from POLENE_GPU.preProcessing.scaler.shiftedLogScaler import ShiftedLogScaler
 from POLENE_GPU.NN.models.resNet import ResNet
+from POLENE_GPU.NN.models.adaptedResNet import ResNet as adaptedResNet
+from POLENE_GPU.NN.models.integratorNet import IntegratorNet
 from POLENE_GPU.NN.trainer.baseTrainer import baseTrainer
 from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
 from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
-from POLENE_GPU.NN.validator.jacobianValidation import jacobianValidation
+from POLENE_GPU.NN.validator.residualsAnalysis import residualAnalysisValidator
 from POLENE_GPU.misc.timer import Timer
 
 import kineticsGPU.torch.reactors.constantP as cstPreactorTorch
@@ -49,28 +52,42 @@ with Timer("Dataset generation"):
     Xdtb, Ydtb = dtbgen.generateDataset(intiCond, CPUparallelProcessing=CPUparallelProcessing)
 
 with Timer("Model creation"):
-    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True)
+    #model = ResNet(Xdtb.nFeatures, 100, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
+    #model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
+    model = adaptedResNet(Xdtb.nFeatures, 556, 4, 260)
+    #model = IntegratorNet(
+    #    input_dim=Xdtb.nFeatures,
+    #    source_dim=55,  # taille de la représentation "terme source"
+    #    source_layers=2,  # profondeur de la branche source
+    #    source_width=350,  # largeur de la branche source
+    #    integrator_layers=2,  # profondeur de l'intégrateur
+    #    integrator_width=350,  # largeur de l'intégrateur
+    #    layerNorm=True,
+    #    activationOnOutput=False,
+    #)
+    #model = ResNet(Xdtb.nFeatures, 556, 4, 260, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
+
 
 with Timer("Database scaling"):
-    scaler = stdScaler() # logScaler(threshold=1e-28) + stdScaler()
+    scaler = stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
     Xdtb_scaled = scaler.fit_transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)
     model.inputScaler = scaler
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)
+    #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)  # for the smallest network
+    #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=40, decaySteps=2000)  # for th biggest network
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=50, lr=0.0009644703688222561, decaySteps=5340, decayRate=0.8772676774813501)  # for the bayesian opted adaptedResnet
+
+
 
 with Timer("Model training"):
     trainer.train(Xdtb_scaled, Ydtb_scaled, model)
 
-plt.semilogy(trainer.stats.loss, label='train')
-plt.semilogy(trainer.stats.valLoss, label='val')
-plt.legend()
-plt.show()
-
-plt.plot(trainer.stats.lr)
-plt.show()
+trainer.plotRanks()
+trainer.plotLoss()
+trainer.plotLr()
 
 with Timer("Validator initialisation"):
     validator = oneStepPredictionValidator(validationDtype=validationDdtype, validationDevice=validationDevice)
@@ -85,9 +102,8 @@ with Timer("Model validaton"):
     validator.validate(model, X, Y, tX, reactormodel.dtcfd)
 
 with Timer("Validator initialisation"):
-    validator = jacobianValidation(validationDtype=validationDdtype, validationDevice=validationDevice)
-    reactorTorch = cstPreactorTorch.constantPReactorTPY(mech, JVPDevice, JVPDtype)
+    validator = residualAnalysisValidator(validationDtype=validationDdtype, validationDevice=validationDevice)
 
 with Timer("Model validaton"):
-    validator.validate(model, X, Y, tX, reactorTorch, reactormodel.dtcfd)
+    validator.validate(model, X, Y, plot=False)
 

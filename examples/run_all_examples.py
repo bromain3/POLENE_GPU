@@ -4,5 +4,9 @@ import database_generation.cantera0D.cantera_cst_V
 import pre_processing.scaling.standard_scaler
 import pre_processing.scaling.log_scaler
 import pre_processing.scaling.log_std_scaling
+import pre_processing.scaling.shifted_log_scaler
+import pre_processing.scaling.shifted_log_std_scaling
 
 import training.baseTraining
+
+import bayesian_optimisation.baseBayesianOpt

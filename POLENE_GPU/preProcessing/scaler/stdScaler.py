@@ -7,11 +7,12 @@ class stdScaler(_BaseTransform):
 
     NULL_RELATIVE_VARIANCE = 1e-12
 
-    def __init__(self):
+    def __init__(self, varianceCutoff=1e-28):  # TODO: faire un scaler "filterScaler" qui filtre les valeurs minuscules. comme ça ou pourait par exemple le mettre avant un scaler log, c'est une forme de pretraitement qui vire des colonnes. sinon vraiement faire une fonction de pretraitement qui met à 0
         self.mean = None
         self.std = None
         self.is_constant = None
         self._input_ndim = None
+        self.varianceCutoff = varianceCutoff
 
     def __checkdim(self, x):
         if x.dim() not in (2, 3):
@@ -47,7 +48,7 @@ class stdScaler(_BaseTransform):
 
         # cv n'est calculé que là où mean != 0 et std != 0
         safe_cv = torch.where(zero_std | zero_mean, torch.zeros_like(self.std), self.std / self.mean.abs())
-        self.is_constant = zero_std | (safe_cv < self.NULL_RELATIVE_VARIANCE)
+        self.is_constant = zero_std | (safe_cv < self.NULL_RELATIVE_VARIANCE) | (self.std < self.varianceCutoff)
 
         return self
 
