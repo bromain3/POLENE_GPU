@@ -1,23 +1,34 @@
 import torch
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import numpy as np
 
 from POLENE_GPU.NN.validator._commonValidator import _commonValidator
+from POLENE_GPU.NN.models.mixtureOfExperts import MixtureOfExperts
 from POLENE_GPU.dataHandler.serie import serie
 
 
 class residualAnalysisValidator(_commonValidator):
-    def validate(self, model, X, Y, plot=False):
+    def validate(self, model, X, Y, plot=False, showClusters: bool = False):
         self._checkInput(model, X, Y)
 
         model.eval()
         model.to(self.validationDtype).to(self.validationDevice)
-        X = X.to(self.validationDtype).to(self.validationDevice)
-        Y = Y.to(self.validationDtype).to(self.validationDevice)
+        X = X.clone().to(self.validationDtype).to(self.validationDevice)
+        Y = Y.clone().to(self.validationDtype).to(self.validationDevice)
+
+        use_clusters = showClusters and isinstance(model, MixtureOfExperts)
 
         with torch.no_grad():
             Y_norm = model.outputScaler.transform(Y)
             Y_hat_norm = model(model.inputScaler.transform(X))  # shape [N, n_out]
+
+            labels = None
+            n_clusters = None
+            if use_clusters:
+                labels = model.predict_cluster(model.inputScaler.transform(X))
+                labels = labels.cpu().numpy()
+                n_clusters = model.n_experts
 
         residuals_norm = (Y_hat_norm.data - Y_norm.data).cpu().detach().numpy()      # [N, n_out]
         Y_norm_np      = Y_norm.data.cpu().detach().numpy()
@@ -31,13 +42,21 @@ class residualAnalysisValidator(_commonValidator):
         col_names = Y.colName  # list of output names (species / variables)
 
         if plot:
-            self._plot(col_names, Y_norm_np, Y_hat_norm_np, residuals_norm)
+            self._plot(col_names, Y_norm_np, Y_hat_norm_np, residuals_norm,
+                       labels=labels, n_clusters=n_clusters)
         else:
             self._print_stats(col_names, residuals_norm)
 
     # ------------------------------------------------------------------
-    def _plot(self, col_names, Y_norm, Y_hat_norm, residuals, max_subplots=4):
+    def _plot(self, col_names, Y_norm, Y_hat_norm, residuals, max_subplots=4,
+              labels=None, n_clusters=None):
         n_total = len(col_names)
+
+        use_clusters = labels is not None
+        if use_clusters:
+            cmap = cm.get_cmap("tab10", n_clusters)
+            cluster_colors = [cmap(k) for k in range(n_clusters)]
+            point_colors = [cluster_colors[k] for k in labels]
 
         for start in range(0, n_total, max_subplots):
             end = min(start + max_subplots, n_total)
@@ -59,17 +78,35 @@ class residualAnalysisValidator(_commonValidator):
                 i = start + j
 
                 # scatter : y_true_norm vs residual_norm
-                axes_s[j].scatter(Y_norm[:, i], residuals[:, i], s=4, alpha=0.5)
+                if use_clusters:
+                    axes_s[j].scatter(Y_norm[:, i], residuals[:, i], s=4, alpha=0.5,
+                                       c=point_colors)
+                else:
+                    axes_s[j].scatter(Y_norm[:, i], residuals[:, i], s=4, alpha=0.5)
                 axes_s[j].axhline(0, color="red", linewidth=0.8, linestyle="--")
                 axes_s[j].set_xlabel("y_true (normalized)")
                 axes_s[j].set_ylabel("residual (normalized)")
                 axes_s[j].set_title(col)
 
                 # histogram des résidus
-                axes_h[j].hist(residuals[:, i], bins=50, edgecolor="none")
+                if use_clusters:
+                    res_by_cluster = [residuals[labels == c, i] for c in range(n_clusters)]
+                    axes_h[j].hist(res_by_cluster, bins=50, stacked=True,
+                                    color=cluster_colors,
+                                    label=[f"cluster {c}" for c in range(n_clusters)],
+                                    edgecolor="none")
+                else:
+                    axes_h[j].hist(residuals[:, i], bins=50, edgecolor="none")
                 axes_h[j].axvline(0, color="red", linewidth=0.8, linestyle="--")
                 axes_h[j].set_xlabel("residual (normalized)")
                 axes_h[j].set_title(col)
+
+            if use_clusters:
+                handles = [plt.Line2D([0], [0], marker='o', color='w',
+                                       markerfacecolor=cluster_colors[c], markersize=6,
+                                       label=f"cluster {c}") for c in range(n_clusters)]
+                fig_scatter.legend(handles=handles, loc="upper right", ncol=n_clusters)
+                axes_h[0].legend(loc="upper right", fontsize=8)
 
             fig_scatter.suptitle(f"Résidus normalisés — scatter ({start}:{end})", fontsize=12)
 

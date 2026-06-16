@@ -55,8 +55,8 @@ with Timer("Model creation"):
 
 
 with Timer("Database scaling"):
-    scaler = stdScaler()
-    logPenalizationScaler = logScaler(threshold=1e-28) + stdScaler()
+    scaler = logScaler(threshold=1e-28) + stdScaler()
+    logPenalizationScaler = stdScaler()
     logPenalizationScaler.fit(Xdtb)
     Xdtb_scaled = scaler.fit_transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)

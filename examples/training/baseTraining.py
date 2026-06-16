@@ -36,7 +36,6 @@ mech = 'gri30.yaml'
 with Timer("Model creation"):
     reactormodel = cantera0D.cstP(
         kinetics=mech,
-        cstSamplingdt=False,
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -53,8 +52,8 @@ with Timer("Dataset generation"):
 
 with Timer("Model creation"):
     #model = ResNet(Xdtb.nFeatures, 100, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
-    #model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
-    model = adaptedResNet(Xdtb.nFeatures, 556, 4, 260)
+    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
+    #model = adaptedResNet(Xdtb.nFeatures, 556, 4, 260)
     #model = IntegratorNet(
     #    input_dim=Xdtb.nFeatures,
     #    source_dim=55,  # taille de la représentation "terme source"
@@ -69,16 +68,16 @@ with Timer("Model creation"):
 
 
 with Timer("Database scaling"):
-    scaler = stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
+    scaler = logScaler(threshold=1e-28) + stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
     Xdtb_scaled = scaler.fit_transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)
     model.inputScaler = scaler
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30)  # for the smallest network
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, decaySteps=1500)  # for the smallest network
     #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=40, decaySteps=2000)  # for th biggest network
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=50, lr=0.0009644703688222561, decaySteps=5340, decayRate=0.8772676774813501)  # for the bayesian opted adaptedResnet
+    #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=50, lr=0.0009644703688222561, decaySteps=5340, decayRate=0.8772676774813501)  # for the bayesian opted adaptedResnet
 
 
 

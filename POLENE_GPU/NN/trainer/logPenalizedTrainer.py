@@ -115,7 +115,7 @@ class logPenalizedTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSav
             #cosine = torch.dot(g1, g2) / (norm1 * norm2 + 1e-12)
             #print(ratio, cosine)
 
-            lamb = 0#5e-6
+            lamb = 0.1 #TODO: implement Gradnorm. il ne semble pas y avoir de cosine similarity negative sauf exception donc pas besoin de PCGrad
             loss = (1-lamb) * lossRaw + lamb * lossLog
 
             loss.backward()

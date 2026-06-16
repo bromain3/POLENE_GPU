@@ -187,13 +187,21 @@ class serie:
             self.storingDtype
         )
 
+    def clone(self):
+        return serie._from_raw(
+            self.data.clone(),
+            self.colName.copy(),
+            self.storingDevice,
+            self.storingDtype
+        )
+
     def save(self, filepath, n_threads=None):
         arr = self.data.detach().cpu().numpy()
         if not arr.flags['C_CONTIGUOUS']:
             arr = np.ascontiguousarray(arr)
 
         bytes_per_row = arr[0].nbytes
-        target_chunk_bytes = 4 * 1024 * 1024
+        target_chunk_bytes = 4 * 1024 * 1024 * 100
         chunk_rows = max(1, min(arr.shape[0], target_chunk_bytes // max(1, bytes_per_row)))
         chunk_shape = (chunk_rows,) + arr.shape[1:]
         n_chunks = (arr.shape[0] + chunk_rows - 1) // chunk_rows

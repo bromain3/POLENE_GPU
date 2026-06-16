@@ -10,8 +10,8 @@ class jacobianValidation(_commonValidator):
 
         model.eval()
         model.to(self.validationDtype).to(self.validationDevice)
-        X = X.to(self.validationDtype).to(self.validationDevice)
-        Y = Y.to(self.validationDtype).to(self.validationDevice)
+        X = X.clone().to(self.validationDtype).to(self.validationDevice)
+        Y = Y.clone().to(self.validationDtype).to(self.validationDevice)
 
         v = Y.data - model.outputScaler.inverse_transform(model(model.inputScaler.transform(X))).data
 

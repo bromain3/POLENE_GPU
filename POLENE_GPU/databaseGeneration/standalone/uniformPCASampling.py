@@ -213,7 +213,7 @@ def _sample_sobol(n: int, mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
     return mins + (maxs - mins) * u
 
 
-def _draw_latent(n: int, mins: np.ndarray, maxs: np.ndarray,
+def _draw_latent(n: int, mins: np.ndarray, maxs: np.ndarray,# TODO: ajouter une option pour soit sampler uniformément soit suivant une gaussienne car il semble que les PC ont tendance à gaussianiser les distributions (à s'approcher d'un cercle en outre) et c'est ce qu'on observe
                  mode: str, rng: np.random.Generator) -> np.ndarray:
     """Dispatch to the right latent-space sampler."""
     if mode == "lhs":

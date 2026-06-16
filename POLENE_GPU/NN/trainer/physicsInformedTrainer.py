@@ -50,7 +50,7 @@ class DirectionalSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _st
         self.trainingDtype = trainingDtype
         self.lmbda = lmbda
 
-    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
+    def __trainingPhase(self, X, Y, target_jacobians, mask, model, optimizer, lrScheduler):
         model.train()
         totalLoss = totalLV = totalLJ = 0.0
 
@@ -60,8 +60,9 @@ class DirectionalSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _st
             bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bM = mask[start:start + self.batchSize].to(self.trainingDevice).to(torch.bool)
 
-            lv, lj = directional_sobolev_losses(model, bX, bY, bJ)
+            lv, lj = directional_sobolev_losses(model, bX, bY, bJ, bM)
             loss = (1.0 - self.lmbda) * lv + self.lmbda * lj
 
             optimizer.zero_grad()
@@ -82,11 +83,18 @@ class DirectionalSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _st
         self.stats.loss.append(totalLoss)
         return totalLoss, totalLV, totalLJ
 
-    def train(self, X, Y, J_X, model):
+    def train(self, X, Y, J_X, model, jacobian_mask=None):
         torch.cuda.empty_cache()
         gc.collect()
 
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+        if jacobian_mask is None:
+            mask_train = None
+            mask_val = None
+            X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+        else:
+            X_train, X_val, Y_train, Y_val, J_train, J_val, mask_train, mask_val = self.trainTestSplit(X, Y, J_X, jacobian_mask)
+            mask_train = mask_train.data.flatten()
+            mask_val = mask_val.data.flatten()
 
         model.to(self.trainingDevice).to(self.trainingDtype)
         optimizer, lrScheduler = self._build_optimizer(model)
@@ -94,9 +102,7 @@ class DirectionalSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _st
         self.stats.ranks.append(self.compute_effective_ranks(model))
 
         for epoch in range(self.epochs):
-            trainLoss, lv, lj = self.__trainingPhase(
-                X_train, Y_train, J_train, model, optimizer, lrScheduler
-            )
+            trainLoss, lv, lj = self.__trainingPhase(X_train, Y_train, J_train, mask_train, model, optimizer, lrScheduler)
             valLoss, jacobianValLoss = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
             self.stats.ranks.append(self.compute_effective_ranks(model))
 
@@ -148,7 +154,7 @@ class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixi
         self.lmbda = lmbda
         self.alpha = alpha
 
-    def __trainingPhase(self, X, Y, target_jacobians, model, pc_optimizer, lrScheduler):
+    def __trainingPhase(self, X, Y, target_jacobians, mask, model, pc_optimizer, lrScheduler):
         model.train()
         totalLoss = totalLV = totalLJ = 0.0
 
@@ -158,9 +164,10 @@ class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixi
             bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bM = mask[start:start + self.batchSize].to(self.trainingDevice).to(torch.bool)
 
             if self.alpha is None:
-                lv, lj = directional_sobolev_losses(model, bX, bY, bJ)
+                lv, lj = directional_sobolev_losses(model, bX, bY, bJ, bM)
             else:
                 lv, lj = directional_sobolev_losses_cone(model, bX, bY, bJ, alpha=self.alpha)
 
@@ -186,11 +193,19 @@ class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixi
         self.stats.loss.append(totalLoss)
         return totalLoss, totalLV, totalLJ
 
-    def train(self, X, Y, J_X, model):
+    def train(self, X, Y, J_X, model, jacobian_mask=None):
         torch.cuda.empty_cache()
         gc.collect()
 
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+
+        if jacobian_mask is None:
+            mask_train = None
+            mask_val = None
+            X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_X)
+        else:
+            X_train, X_val, Y_train, Y_val, J_train, J_val, mask_train, mask_val = self.trainTestSplit(X, Y, J_X, jacobian_mask)
+            mask_train = mask_train.data.flatten()
+            mask_val = mask_val.data.flatten()
 
         model.to(self.trainingDevice).to(self.trainingDtype)
         base_optimizer, lrScheduler = self._build_optimizer(model)
@@ -199,9 +214,7 @@ class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixi
         self.stats.ranks.append(self.compute_effective_ranks(model))
 
         for epoch in range(self.epochs):
-            trainLoss, lv, lj = self.__trainingPhase(
-                X_train, Y_train, J_train, model, pc_optimizer, lrScheduler
-            )
+            trainLoss, lv, lj = self.__trainingPhase(X_train, Y_train, J_train, mask_train, model, pc_optimizer, lrScheduler)
             valLoss, jacobianValLoss = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
             self.stats.ranks.append(self.compute_effective_ranks(model))
 

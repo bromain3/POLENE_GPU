@@ -179,6 +179,7 @@ def directional_sobolev_losses(
     batch_X,
     batch_Y,
     target_jacobians,
+    jacobian_mask=None
 ):  #TODO: peut être apprendre la jacobienne dans la direction omega et pas Y-X, c'est toujours la direction de la dynamique mais d'un côté on approxime alors que de l'autre on est exacte
     """
     Directional Sobolev losses for a batch, using v = Y - X as direction.
@@ -194,40 +195,23 @@ def directional_sobolev_losses(
     def model_fn(x):
         return model(x, tensorInput=True)
 
-    _, Jv_pred = torch.func.jvp(model_fn, (batch_X.data,), (v,))     # (B, d_out)
+    _, Jv_pred = torch.func.jvp(model_fn, (batch_X.data,), (v,))    # (B, d_out)
 
     loss_values = nn.functional.mse_loss(preds.data, batch_Y.data)
 
-    Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (B, d_out)
-    loss_jacob = nn.functional.mse_loss(Jv_pred, Jv_true)  #TODO: look at jacobian normalisation to prevent overfitting the reactive zones
+    if jacobian_mask is None:
+        # Comportement identique à l'original
+        Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (B, d_out)
+        loss_jacob = nn.functional.mse_loss(Jv_pred, Jv_true)
+    else:
+        # On filtre avant le bmm — plus efficace que de masquer après
+        v_m    = v[jacobian_mask]                          # (M, d_in)
+        J_m    = target_jacobians.data[jacobian_mask]      # (M, d_in, d_out)  ou (M, d_out, d_in) selon convention
+        Jv_p_m = Jv_pred[jacobian_mask]                   # (M, d_out)
 
-    return loss_values, loss_jacob
-
-def directional_sobolev_losses_per_sample(
-    model,
-    batch_X,
-    batch_Y,
-    target_jacobians,
-):
-    """
-    Même logique que directional_sobolev_losses mais retourne
-    des tenseurs (B,) au lieu de scalaires, pour permettre
-    une pondération par échantillon.
-    """
-    v = batch_Y.data - batch_X.data  # (B, d_in)
-
-    preds = model(batch_X)
-
-    def model_fn(x):
-        return model(x, tensorInput=True)
-
-    _, Jv_pred = torch.func.jvp(model_fn, (batch_X.data,), (v,))  # (B, d_out)
-
-    # Per-sample MSE : moyenne sur d_out, pas sur le batch
-    loss_values = ((preds.data - batch_Y.data) ** 2).mean(dim=-1)  # (B,)
-
-    Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (B, d_out)
-    loss_jacob = ((Jv_pred - Jv_true) ** 2).mean(dim=-1)  # (B,)
+        Jv_true_m = torch.bmm(J_m, v_m.unsqueeze(2)).squeeze(2)   # (M, d_out)
+        loss_jacob = nn.functional.mse_loss(Jv_p_m, Jv_true_m)
+    #TODO: look at jacobian normalisation to prevent overfitting the reactive zones
 
     return loss_values, loss_jacob
 

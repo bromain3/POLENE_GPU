@@ -113,6 +113,7 @@ def resampleManifold(Xdtb, Ydtb, sampleNumbers, manifoldDim=2, nbins=50, plots=T
     # ──────────────────────────────────────────────────────────────────────────────
     # VISUALISATION
     # ──────────────────────────────────────────────────────────────────────────────
+    # TODO: ajouter une option pour soit sampler uniformément soit suivant une gaussienne car il semble que les PC ont tendance à gaussianiser les distributions (à s'approcher d'un cercle en outre) et c'est ce qu'on observe
     #TODO: ajouter une option pour resampler par rapport à des PC données care toutes les PC se resmblent plus u moins sauf les PC liées aux produits azotés
     if plots: #TODO: changer pour plot la distribution de toutes les PC avant et après resamplling, je pense que les PC qui ont des gros loadings en N2 seront toujours désequilibrées alors que les autres seront globalement bien foutues, à voir
         n_plots = min(K_PCA, 3)
