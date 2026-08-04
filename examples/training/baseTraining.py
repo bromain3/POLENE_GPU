@@ -1,8 +1,9 @@
 import POLENE_GPU.databaseGeneration.models.cantera0D as cantera0D
 import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
+from POLENE_GPU.dataHandler.serie import concat
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
-from POLENE_GPU.preProcessing.scaler.shiftedLogScaler import ShiftedLogScaler
+from POLENE_GPU.preProcessing.scaler.softLogScaler import softlogScaler
 from POLENE_GPU.NN.models.resNet import ResNet
 from POLENE_GPU.NN.models.adaptedResNet import ResNet as adaptedResNet
 from POLENE_GPU.NN.models.integratorNet import IntegratorNet
@@ -11,6 +12,8 @@ from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
 from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
 from POLENE_GPU.NN.validator.residualsAnalysis import residualAnalysisValidator
 from POLENE_GPU.misc.timer import Timer
+from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ, getScaledTransformationJExplicit, getChemicalJacobian, getTransformationJ
+from POLENE_GPU.databaseGeneration.standalone.ILDMaugmentation import sampleManifoldAugmentation
 
 import kineticsGPU.torch.reactors.constantP as cstPreactorTorch
 
@@ -36,6 +39,7 @@ mech = 'gri30.yaml'
 with Timer("Model creation"):
     reactormodel = cantera0D.cstP(
         kinetics=mech,
+        dtcfd=1e-7
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -44,11 +48,17 @@ with Timer("DatabaseGenerator creation"):
 with Timer("Single trajectory"):
     X, Y, tX, tY = dtbgen.generateSingleTrajectory({'T': 1700, 'P': 101325, 'phi': 1.0})
 
+
 with Timer("Initial conditions sampling"):
     intiCond = dtbgen.generateInitialConditionSamples('Halton', n_init_cond)
 
 with Timer("Dataset generation"):
     Xdtb, Ydtb = dtbgen.generateDataset(intiCond, CPUparallelProcessing=CPUparallelProcessing)
+    #Xdtb = Xdtb.drop(['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'])
+    #Ydtb = Ydtb.drop(['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'])
+    #X = X.drop(['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'])
+    #Y = Y.drop(['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'])
+
 
 with Timer("Model creation"):
     #model = ResNet(Xdtb.nFeatures, 100, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
@@ -68,14 +78,21 @@ with Timer("Model creation"):
 
 
 with Timer("Database scaling"):
-    scaler = logScaler(threshold=1e-28) + stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
+
+    #scaler = logScaler(threshold=1e-28)
+    #scaler.NON_SPECIES_COLS = []
+    #scaler = scaler + stdScaler()
+
+    #scaler = logScaler(threshold=1e-28) + stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
+    scaler = stdScaler()
+    #scaler = softlogScaler(threshold=1e-28, verbose=True) + stdScaler()
     Xdtb_scaled = scaler.fit_transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)
     model.inputScaler = scaler
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=30, decaySteps=1500)  # for the smallest network
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=10, decaySteps=1500, lr=5e-3)  # for the smallest network
     #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=40, decaySteps=2000)  # for th biggest network
     #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=50, lr=0.0009644703688222561, decaySteps=5340, decayRate=0.8772676774813501)  # for the bayesian opted adaptedResnet
 

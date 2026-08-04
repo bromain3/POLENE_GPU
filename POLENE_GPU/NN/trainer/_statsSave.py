@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import math
 
 class TrainerStats:
     def __init__(self):
@@ -148,7 +149,13 @@ class _statsSave:
         # ── zones vanishing / exploding ───────────────────────────────────────
         # On calcule les limites y *après* avoir tracé les courbes pour que
         # axhspan couvre bien tout l'axe visible.
-        all_vals = [v for vals in series.values() for v in vals if v > 0]
+        all_vals = [
+            v
+            for vals in series.values()
+            for v in vals
+            if v > 0 and math.isfinite(v)
+        ]
+
         y_min = min(all_vals) * 0.5 if all_vals else 1e-8
         y_max = max(all_vals) * 2.0 if all_vals else 1e2
 

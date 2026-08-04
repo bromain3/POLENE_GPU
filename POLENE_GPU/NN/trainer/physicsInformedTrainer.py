@@ -1,5 +1,7 @@
 from POLENE_GPU.NN.trainer._statsSave import _statsSave
 from POLENE_GPU.NN.trainer._mixins import SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin, PCGradMixin, EffectiveRankMixin
+from POLENE_GPU.NN.trainer._mixins import SchedulerMixin, SplitMixin, ValidationMixin, EffectiveRankMixin, GradNormTrackingMixin, ActivationTrackingMixin, PerOutputGradMixin
+
 from POLENE_GPU.NN.trainer._losses import (
     directional_sobolev_losses,
     full_sobolev_loss,
@@ -164,7 +166,10 @@ class DirectionalPCgradSobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixi
             bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            bM = mask[start:start + self.batchSize].to(self.trainingDevice).to(torch.bool)
+            if mask is not None:
+                bM = mask[start:start + self.batchSize].to(self.trainingDevice).to(torch.bool)
+            else:
+                bM = None
 
             if self.alpha is None:
                 lv, lj = directional_sobolev_losses(model, bX, bY, bJ, bM)
@@ -422,16 +427,10 @@ class SobolevTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
             )
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-class integratorSurogateTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
-    """
-    Integrator surrogate trainer.
-
-    Combines MSE on function values with a Jacobian inverse consistency loss:
-        loss = MSE(pred, Y) + jac_inv_loss(J_pred, J_1) / scale
-
-    The jac_inv_loss enforces J_model ≈ J_true^{-1}.
-    """
+class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, EffectiveRankMixin,
+                       GradNormTrackingMixin, ActivationTrackingMixin, PerOutputGradMixin):
 
     def __init__(
             self,
@@ -444,104 +443,10 @@ class integratorSurogateTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _st
             batchSize=128,
             trainingDevice=None,
             trainingDtype=None,
-            jacLossScale=430,
-    ):
-        _statsSave.__init__(self)
-        self.testSize = testSize
-        self.lr = lr
-        self.warmupSteps = warmupSteps
-        self.decayRate = decayRate
-        self.decaySteps = decaySteps
-        self.epochs = epochs
-        self.batchSize = batchSize
-        self.trainingDevice = trainingDevice
-        self.trainingDtype = trainingDtype
-        self.jacLossScale = jacLossScale
-
-    def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
-        model.train()
-        totalLoss = totalLJ = totalLV = 0.0
-
-        for start in tqdm(range(0, X.nSamples, self.batchSize)):
-            self.stats.lr.append(optimizer.param_groups[0]['lr'])
-
-            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-            lj = jac_inv_loss(model, bX, bJ) / self.jacLossScale
-
-            preds = model(bX)
-            lv = nn.functional.mse_loss(bY.data, preds.data)
-
-            loss = lj + lv
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lrScheduler.step()
-
-            n = bX.data.size(0)
-            totalLoss += loss.item() * n
-            totalLJ += lj.item() * n
-            totalLV += lv.item() * n
-
-        N = X.nSamples
-        totalLoss /= N;
-        totalLJ /= N;
-        totalLV /= N
-        self.stats.loss.append(totalLoss)
-        return totalLoss, totalLJ, totalLV
-
-    def train(self, X, Y, J_1, model):
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_1)
-
-        model.to(self.trainingDevice).to(self.trainingDtype)
-        optimizer, lrScheduler = self._build_optimizer(model)
-
-        for epoch in range(self.epochs):
-            trainLoss, lj, lv = self.__trainingPhase(
-                X_train, Y_train, J_train, model, optimizer, lrScheduler
-            )
-            valLoss = self._validation_phase(X_val, Y_val, model)
-
-            print(
-                f"[{epoch + 1}/{self.epochs}] "
-                f"Train: {self._format_loss(trainLoss)}"
-                f"  (mse: {self._format_loss(lv)}  |  jac: {self._format_loss(lj)})  |  "
-                f"Val MSE: {self._format_loss(valLoss)}  |  "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-            )
-
-
-from POLENE_GPU.NN.trainer._statsSave import _statsSave
-from POLENE_GPU.NN.trainer._mixins import SchedulerMixin, SplitMixin, ValidationMixin, GradNormMixin
-from POLENE_GPU.NN.trainer._losses import jvp_physics_loss
-
-import torch
-import torch.nn as nn
-from tqdm import tqdm
-import gc
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, EffectiveRankMixin):
-
-    def __init__(
-            self,
-            testSize=0.25,
-            lr=5e-3,
-            warmupSteps=2000,
-            decayRate=0.92,
-            decaySteps=1500,
-            epochs=50,
-            batchSize=128,
-            trainingDevice=None,
-            trainingDtype=None,
-            alpha=None
+            alpha=None,
+            trackGradient=False,
+            trackActivation=False,
+            trackPerOutputGrad=False,
     ):
         _statsSave.__init__(self)
         self.testSize = testSize
@@ -555,9 +460,18 @@ class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, E
         self.trainingDtype = trainingDtype
         self.alpha = alpha
 
+        self.trackGradient = trackGradient
+        self.trackActivation = trackActivation
+        self.trackPerOutputGrad = trackPerOutputGrad
+
     def __trainingPhase(self, X, Y, target_jacobians, model, optimizer, lrScheduler):
         model.train()
         totalLoss = 0.0
+
+        if self.trackGradient:
+            self._reset_grad_stats()
+        if self.trackPerOutputGrad:
+            self._reset_per_output_stats()
 
         for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
@@ -566,18 +480,38 @@ class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, E
             bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
             bJ = target_jacobians[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
+            optimizer.zero_grad()
+
+            # --- Pour le tracking d'activations et per-output grad, il faut un forward
+            # séparé produisant `preds` avant que la loss jacobienne ne consomme le graphe.
+            if self.trackActivation:
+                self._start_recording("train")
+            if self.trackActivation or self.trackPerOutputGrad:
+                preds = model(bX)
+            if self.trackActivation:
+                self._stop_recording()
+
+            if self.trackPerOutputGrad:
+                self._track_per_output_grads(model, preds.data, bY.data)
+
             if self.alpha is None:
                 loss = manifoldJacobianLoss(model, bX, bY, bJ)
             else:
                 loss = manifoldJacobianLoss_cone(model, bX, bY, bJ, self.alpha)
-            optimizer.zero_grad()
+
             loss.backward()
+
+            if self.trackGradient:
+                self._track_grad_norms(model)
+
             optimizer.step()
             lrScheduler.step()
 
             n = bX.data.size(0)
             totalLoss += loss.item() * n
 
+        self._flush_grad_epoch()
+        self._flush_per_output_epoch()
 
         N = X.nSamples
         totalLoss /= N
@@ -595,12 +529,21 @@ class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, E
 
         self.stats.ranks.append(self.compute_effective_ranks(model))
 
+        if self.trackActivation:
+            self._register_activation_hooks(model)
+
         for epoch in range(self.epochs):
+            if self.trackActivation:
+                self._new_activation_epoch()
+
             trainLoss = self.__trainingPhase(
                 X_train, Y_train, J_train, model, optimizer, lrScheduler
             )
             valLoss, valLossJac = self._validation_phase_with_jacobian(X_val, Y_val, J_val, model)
             self.stats.ranks.append(self.compute_effective_ranks(model))
+
+            if self.trackActivation:
+                self._flush_activation_epoch()
 
             print(
                 f"[{epoch + 1}/{self.epochs}] "
@@ -609,84 +552,8 @@ class JacobianTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, E
                 f"LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-class dataJVPTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave):
-    """
-    Trains purely on the directional Jacobian loss (no MSE on values):
-
-        loss = MSE( J_network(X)·(Y-X),  J_true·(Y-X) )
-
-    Uses pre-computed Jacobians J_true at X.
-    Validation is still evaluated with MSE on predictions.
-    """
-
-    def __init__(
-        self,
-        testSize=0.25,
-        lr=5e-3,
-        warmupSteps=2000,
-        decayRate=0.92,
-        decaySteps=1500,
-        epochs=50,
-        batchSize=128,
-        trainingDevice=None,
-        trainingDtype=None,
-    ):
-        _statsSave.__init__(self)
-        self.testSize = testSize
-        self.lr = lr
-        self.warmupSteps = warmupSteps
-        self.decayRate = decayRate
-        self.decaySteps = decaySteps
-        self.epochs = epochs
-        self.batchSize = batchSize
-        self.trainingDevice = trainingDevice
-        self.trainingDtype = trainingDtype
-
-    def __trainingPhase(self, X, Y, J_Y, model, optimizer, lrScheduler):
-        model.train()
-        totalLoss = 0.0
-
-        for start in tqdm(range(0, X.nSamples, self.batchSize)):
-            self.stats.lr.append(optimizer.param_groups[0]['lr'])
-
-            bX  = X  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            bY  = Y  [start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-            bJY = J_Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-
-            loss = jvp_physics_loss(model, bX, bY, bJY)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lrScheduler.step()
-
-            totalLoss += loss.item() * bX.data.size(0)
-
-        totalLoss /= X.nSamples
-        self.stats.loss.append(totalLoss)
-        return totalLoss
-
-    def train(self, X, Y, J_Y, model):
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        X_train, X_val, Y_train, Y_val, J_train, J_val = self.trainTestSplit(X, Y, J_Y)
-
-        model.to(self.trainingDevice).to(self.trainingDtype)
-        optimizer, lrScheduler = self._build_optimizer(model)
-
-        for epoch in range(self.epochs):
-            trainLoss = self.__trainingPhase(X_train, Y_train, J_train, model, optimizer, lrScheduler)
-            valLoss   = self._validation_phase(X_val, Y_val, model)
-
-            print(
-                f"[{epoch + 1}/{self.epochs}] "
-                f"Train (jac mse): {self._format_loss(trainLoss)}  |  "
-                f"Val (pred mse): {self._format_loss(valLoss)}  |  "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-            )
+        if self.trackActivation:
+            self._remove_activation_hooks()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

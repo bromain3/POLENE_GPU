@@ -109,6 +109,11 @@ def manifoldJacobianLoss(
     _, Jv_pred = torch.func.jvp(model_fn, (batch_X.data,), (v,))     # (B, d_out)
 
     Jv_true = torch.bmm(target_jacobians.data, v.unsqueeze(2)).squeeze(2)  # (B, d_out)
+
+    #J_norm = torch.linalg.norm(target_jacobians.data, dim=(1, 2), keepdim=True)  # (B,1)
+    #Jv_pred = Jv_pred / J_norm
+    #Jv_true = Jv_true / J_norm
+
     loss_jacob = nn.functional.mse_loss(Jv_pred, Jv_true)  #TODO: look at jacobian normalisation to prevent overfitting the reactive zones
 
     return loss_jacob

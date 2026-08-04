@@ -95,7 +95,7 @@ def getScaledTransformationJExplicit(reactorType, mech, X, Y, inputScaler, outpu
         J_phys[:, range(n), range(n)] += 1
         J_out = outputScaler.J(serie(y, Y.colName, storingDevice=storingDevice, storingDtype=storingDtype))
         J_1_in = inputScaler.J_1(inputScaler.transform(serie(x, X.colName, storingDevice=storingDevice, storingDtype=storingDtype)))
-        return J_out.unsqueeze(2) * J_phys * J_1_in.unsqueeze(1)
+        return J_out.unsqueeze(2) * J_phys * J_1_in.unsqueeze(1) #TODO: vérifier cela car il semblerai que la formule soit +- inversée, ce qui pourait expliquer les résultats un peu étranges rencontrés.
 
     J_scaled = batched_apply(compute, X.data[:, 0].flatten(), X.data[:, 1].flatten(), X.data[:, 2:], X.data, Y.data, batch_size=batch_size, device=computationDevice, dtype=torch.float64)
     return serie(J_scaled, ['J'], storingDevice=storingDevice, storingDtype=storingDtype)

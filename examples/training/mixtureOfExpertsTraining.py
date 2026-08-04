@@ -37,6 +37,7 @@ mech = 'gri30.yaml'
 with Timer("Model creation"):
     reactormodel = cantera0D.cstP(
         kinetics=mech,
+        dtcfd=1e-7
     )
 
 with Timer("DatabaseGenerator creation"):
