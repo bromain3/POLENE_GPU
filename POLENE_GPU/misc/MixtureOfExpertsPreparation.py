@@ -123,17 +123,31 @@ def _compute_clusters(X_struct, clustering_scaler, n_clusters, random_state):
 
 def _split_by_labels(X, Y, labels, n_clusters):
     """
-    Découpe X et Y en listes de sous-series selon `labels`.
+    Découpe X et chaque série de Y en sous-series selon `labels`.
 
-    X et Y doivent être alignés échantillon par échantillon avec `labels`
-    (même nombre de samples, même ordre).
+    X et chaque élément de Y doivent être alignés échantillon par
+    échantillon avec `labels` (même nombre de samples, même ordre).
+
+    Parameters
+    ----------
+    X      : serie
+    Y      : list[serie] — plusieurs séries alignées sur les mêmes échantillons
+    labels : np.ndarray
+    n_clusters : int
+
+    Returns
+    -------
+    X_list : list[serie]        — un sous-dataset X par cluster
+    Y_list : list[list[serie]]  — Y_list[k] est la liste des sous-series de
+                                  Y (une par élément de la liste d'origine)
+                                  restreintes aux échantillons du cluster k
     """
     X_list, Y_list = [], []
     for k in range(n_clusters):
         mask    = torch.from_numpy(labels == k)
         indices = mask.nonzero(as_tuple=True)[0]
         X_list.append(X[indices])
-        Y_list.append(Y[indices])
+        Y_list.append([y[indices] for y in Y])
 
     return X_list, Y_list
 
@@ -201,7 +215,9 @@ def prepare_moe_datasets_shared_scaler(
     clusterer          : fitted KMeans
     clustering_scaler  : the fitted routing scaler (pass to MixtureOfExperts)
     X_list             : list[serie]   — raw sub-datasets, one per cluster
-    Y_list             : list[serie]   — raw sub-datasets, one per cluster
+    Y_list             : list[list[serie]]  — Y_list[k] is the list of
+                          sub-series (one per element of the input Y list)
+                          restricted to cluster k's samples
     scaler_list        : list[scaler]  — deep copies of the global expert scaler
     """
     if X_struct is None:
@@ -254,7 +270,9 @@ def prepare_moe_datasets_per_cluster_scaler(
     clusterer          : fitted KMeans
     clustering_scaler  : the fitted routing scaler (pass to MixtureOfExperts)
     X_list             : list[serie]   — raw sub-datasets, one per cluster
-    Y_list             : list[serie]   — raw sub-datasets, one per cluster
+    Y_list             : list[list[serie]]  — Y_list[k] is the list of
+                          sub-series (one per element of the input Y list)
+                          restricted to cluster k's samples
     scaler_list        : list[scaler]  — one scaler fitted on cluster k's X
     """
     if X_struct is None:

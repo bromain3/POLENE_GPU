@@ -14,9 +14,9 @@ _worker_reactor_class = None
 _worker_dt = None
 
 
-def _worker_init(kinetics, reactorType, dt):
+def _worker_init(kinetics, reactorType, dt, rtol=1e-9, atol=1e-15):
     """Appelé une seule fois à la création du worker — parse le YAML ici."""
-    global _worker_gas_start, _worker_gas_mid, _worker_gas_targ, _worker_reactor_class, _worker_dt
+    global _worker_gas_start, _worker_gas_mid, _worker_gas_targ, _worker_reactor_class, _worker_dt, _worker_rtol, _worker_atol
 
     if reactorType == 'cstV':
         _worker_reactor_class = ct.IdealGasReactor
@@ -29,6 +29,8 @@ def _worker_init(kinetics, reactorType, dt):
     _worker_gas_mid   = ct.Solution(kinetics)
     _worker_gas_targ  = ct.Solution(kinetics)
     _worker_dt = dt
+    _worker_rtol = rtol
+    _worker_atol = atol
 
 
 def _worker_task(args):
@@ -48,7 +50,7 @@ def _worker_task(args):
         - x_prime : état du réacteur initialisé en X et intégré jusqu'à dt'
         - y_prime : état du réacteur initialisé en X' et intégré pendant dt secondes
     """
-    global _worker_gas_start, _worker_gas_mid, _worker_gas_targ, _worker_reactor_class, _worker_dt
+    global _worker_gas_start, _worker_gas_mid, _worker_gas_targ, _worker_reactor_class, _worker_dt, _worker_rtol, _worker_atol
 
     state, dt_prime = args
     dt = _worker_dt
@@ -63,6 +65,8 @@ def _worker_task(args):
     _worker_gas_mid.TPY = T_ini, P_ini, Y_ini
     reactor_mid = _worker_reactor_class(_worker_gas_mid)
     net_mid = ct.ReactorNet([reactor_mid])
+    net_mid.rtol = _worker_rtol
+    net_mid.atol = _worker_atol
 
     if dt_prime > 0.0:
         net_mid.advance(dt_prime)
@@ -77,6 +81,8 @@ def _worker_task(args):
     _worker_gas_targ.TPY = reactor_mid.T, reactor_mid.thermo.P, reactor_mid.thermo.Y
     reactor_targ = _worker_reactor_class(_worker_gas_targ)
     net_targ = ct.ReactorNet([reactor_targ])
+    net_targ.rtol = _worker_rtol
+    net_targ.atol = _worker_atol
     net_targ.advance(dt)
 
     y_prime = np.array(

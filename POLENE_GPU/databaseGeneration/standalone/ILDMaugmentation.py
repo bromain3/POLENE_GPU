@@ -3,10 +3,19 @@ Génération d'états perturbés le long des modes propres de la jacobienne
 chimique, dans l'esprit de la construction des ILDM de Maas & Pope,
 Combust. Flame 88 (1992) 239-264.
 
-Version 3 : perturbation MULTIPLICATIVE en espace log-concentration
-(z_i = ln C_i), pour que l'amplitude de perturbation soit proportionnelle
-à la magnitude locale de chaque espèce plutôt qu'une valeur absolue fixée
-par les espèces majoritaires. Voir la dérivation dans la discussion :
+Version 4 : identique à la version 3 (perturbation MULTIPLICATIVE en espace
+log-concentration, z_i = ln C_i), avec en plus :
+
+  * un paramètre `N_samples` : nombre final d'états souhaité. Si il est
+    fourni, N_samples états sont d'abord tirés AVEC REMISE dans TPY, puis la
+    méthode de perturbation (inchangée) est appliquée à chacun d'eux.
+    Si `N_samples=None`, le comportement est celui de la version 3
+    (un état perturbé par état d'entrée).
+  * l'utilisation effective de `_extract_states_and_meta` / `_wrap_output`,
+    de sorte que serie / torch.Tensor sont réellement supportés en entrée
+    et en sortie.
+
+Rappel de la méthode :
 
     J_z = D^{-1} J D - diag(omega / C),   D = diag(C)
 
@@ -19,9 +28,9 @@ La perturbation est appliquée comme C_new = C_used * exp(dz), ce qui
 garantit C_new > 0 automatiquement (plus de clipping nécessaire) et une
 somme des fractions massiques exactement égale à 1 par construction.
 
-Entrées/sorties : accepte np.ndarray, torch.Tensor, ou un objet `serie`
-maison (avec attributs .data, .colName, .storingDevice, .storingDtype) et
-renvoie un objet du même type.
+Entrées/sorties : accepte un objet `serie` maison (avec attributs .data,
+.colName, .storingDevice, .storingDtype) ou un torch.Tensor, et renvoie un
+objet du même type.
 """
 
 import cantera as ct
@@ -276,6 +285,11 @@ def _perturb_chunk(
     return Y_out
 
 
+def _perturb_chunk_star(args):
+    """Adaptateur : pool.imap ne passe qu'un seul argument (le tuple de la tâche)."""
+    return _perturb_chunk(*args)
+
+
 # --------------------------------------------------------------------
 # Diagnostic
 # --------------------------------------------------------------------
@@ -335,17 +349,17 @@ def _describe_modes(kinetics, T0, P0, Y0, modes_conserved, modes_reactive, zero_
 
 
 # --------------------------------------------------------------------
-# Interface entrée/sortie générique (np.ndarray / torch.Tensor / serie)
+# Interface entrée/sortie générique (torch.Tensor / serie)
 # --------------------------------------------------------------------
 
 def _extract_states_and_meta(TPY):
     """
-    Extrait un tableau numpy (N, 2+n_sp) et les métadonnées nécessaires
-    pour reconstruire un objet du même type en sortie. Supporte :
+    Extrait un tableau (N, 2+n_sp) (conversion interne nécessaire pour
+    Cantera/SciPy) et les métadonnées nécessaires pour reconstruire un objet
+    du même type en sortie. Supporte :
       - un objet `serie` maison (attributs .data, .colName, .storingDevice,
         .storingDtype),
-      - un torch.Tensor,
-      - un np.ndarray / array-like.
+      - un torch.Tensor.
     """
     if hasattr(TPY, "colName") and hasattr(TPY, "data"):
         states = TPY.data.cpu().detach().numpy()
@@ -358,10 +372,12 @@ def _extract_states_and_meta(TPY):
         }
     elif isinstance(TPY, torch.Tensor):
         states = TPY.cpu().detach().numpy()
-        meta = {"type": "tensor"}
+        meta = {"type": "tensor", "dtype": TPY.dtype, "device": TPY.device}
     else:
-        states = np.asarray(TPY, dtype=float)
-        meta = {"type": "array"}
+        raise TypeError(
+            f"Type d'entrée non supporté : {type(TPY).__name__} "
+            "(attendu : serie ou torch.Tensor)."
+        )
     return states, meta
 
 
@@ -372,9 +388,7 @@ def _wrap_output(arr, meta):
             storingDevice=meta["storingDevice"],
             storingDtype=meta["storingDtype"],
         )
-    if meta["type"] == "tensor":
-        return torch.as_tensor(arr)
-    return arr
+    return torch.as_tensor(arr, dtype=meta["dtype"], device=meta["device"])
 
 
 # --------------------------------------------------------------------
@@ -392,14 +406,20 @@ def generatePerturbedStatesILDM(
     chunksize=200,
     seed=0,
     zero_floor_rel=1e-20,
+    N_samples=None,
 ):
     """
     Génère de nouveaux états perturbés MULTIPLICATIVEMENT (log-espace),
     le long de modes propres locaux de la jacobienne chimique.
 
+    Si `N_samples` est fourni, on commence par tirer N_samples états de TPY
+    AVEC REMISE (tirage uniforme), puis chaque état tiré est perturbé
+    indépendamment (amplitudes/signes/angles tirés à part pour chaque ligne,
+    y compris pour les doublons issus du tirage avec remise).
+
     Parameters
     ----------
-    TPY : serie | torch.Tensor | array-like, shape (N, 2 + n_sp)
+    TPY : serie | torch.Tensor, shape (N_in, 2 + n_sp)
         (T, P, Y_1, ..., Y_n_sp).
     kinetics : str
         Fichier mécanisme cantera.
@@ -413,23 +433,48 @@ def generatePerturbedStatesILDM(
         rapide, calculés en log-espace).
     scale_reactive : float
         Amplitude relative (log-espace) pour les modes réactifs.
+    n_workers, chunksize, seed : cf. versions précédentes. `seed` pilote à
+        la fois le tirage avec remise et les perturbations (flux
+        aléatoires distincts).
     zero_floor_rel : float
         Plancher relatif (fraction de ||C||) pour régulariser les espèces
         exactement absentes (évite log(0) / division par 0).
-    n_workers, chunksize, seed : cf. versions précédentes.
+    N_samples : int ou None
+        Nombre final d'états souhaité. Peut être inférieur ou supérieur à
+        N_in (tirage avec remise). Si None : pas de rééchantillonnage, un
+        état perturbé par état d'entrée (N_in en sortie).
 
     Returns
     -------
-    Un objet du même type que `TPY` (serie / torch.Tensor / np.ndarray),
-    shape (N, 2 + n_sp), avec T, P inchangés et Y > 0 sommant à 1.
+    Un objet du même type que `TPY` (serie / torch.Tensor),
+    shape (N_samples, 2 + n_sp) (ou (N_in, 2 + n_sp) si N_samples=None),
+    avec T, P inchangés par rapport aux états tirés et Y > 0 sommant à 1.
     """
     modes_conserved = modes_conserved or []
     modes_reactive = modes_reactive or []
 
-    col_names = TPY.colName
-    states = TPY.data.cpu().detach().numpy()
+    states_in, meta = _extract_states_and_meta(TPY)
+    N_in = states_in.shape[0]
+    if N_in == 0:
+        raise ValueError("TPY est vide : impossible de tirer des états.")
 
-    N = states.shape[0]
+    # --- Tirage avec remise (avant toute perturbation) ---
+    if N_samples is None:
+        states = states_in
+        N = N_in
+    else:
+        N = int(N_samples)
+        if N <= 0:
+            raise ValueError(f"N_samples doit être un entier > 0 (reçu : {N_samples}).")
+        # Flux distinct de ceux des chunks (qui utilisent default_rng(seed + i))
+        rng_sampling = np.random.default_rng([seed, 0xC0FFEE])
+        idx = rng_sampling.integers(0, N_in, size=N)  # uniforme, avec remise
+        states = states_in[idx]
+        print(
+            f"Tirage avec remise : {N} échantillons parmi {N_in} états "
+            f"({np.unique(idx).size} états sources distincts)."
+        )
+
     if n_workers is None:
         n_workers = mp.cpu_count()
 
@@ -456,44 +501,19 @@ def generatePerturbedStatesILDM(
         initializer=_init_perturbation_worker,
         initargs=(kinetics,),
     ) as pool:
+        # imap (et non starmap) : les résultats arrivent au fil de l'eau, donc
+        # la barre tqdm avance pendant le calcul. L'ordre des chunks est
+        # préservé, donc la concaténation reste cohérente avec `states`.
         results = list(
-            tqdm(pool.starmap(_perturb_chunk, tasks), total=len(tasks), desc="Perturbation ILDM")
+            tqdm(
+                pool.imap(_perturb_chunk_star, tasks),
+                total=len(tasks),
+                desc="Perturbation ILDM",
+                unit="chunk",
+            )
         )
 
     Y_all = np.concatenate(results, axis=0)
     TPY_arr = np.concatenate([states[:, 0:2], Y_all], axis=1)
 
-    TPY_perturbed = serie(
-        TPY_arr, col_names,
-        storingDevice=TPY.storingDevice,
-        storingDtype=TPY.storingDtype,
-    )
-    return TPY_perturbed
-
-
-if __name__ == "__main__":
-    kinetics_file = "gri30.yaml"  # a adapter
-    gas0 = ct.Solution(kinetics_file)
-
-    N_points = 50
-    gas0.TPX = 1500.0, ct.one_atm, "CH4:1, O2:2, N2:7.52"
-    Y0 = gas0.Y
-    n_sp = gas0.n_species
-
-    X = np.zeros((N_points, 2 + n_sp))
-    X[:, 0] = 1500.0
-    X[:, 1] = ct.one_atm
-    X[:, 2:] = Y0
-
-    X_perturbed = generatePerturbedStatesILDM(
-        X,
-        kinetics=kinetics_file,
-        modes_conserved=[],
-        scale_conserved=0.0,
-        modes_reactive=[1, 2],
-        scale_reactive=0.05,
-        chunksize=10,
-    )
-
-    print("Forme des états perturbés :", X_perturbed.shape)
-    print("Somme des Y (doit valoir 1) :", X_perturbed[:, 2:].sum(axis=1)[:5])
+    return _wrap_output(TPY_arr, meta)

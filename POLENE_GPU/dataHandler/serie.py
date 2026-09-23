@@ -117,7 +117,7 @@ class serie:
         return self.ncols
 
     def to(self, device):
-        self.data = self.data.to(device)
+        self.data = self.data.to(device, non_blocking=True)
         self.storingDevice = self.data.device
         self.storingDtype = self.data.dtype
         return self

@@ -18,6 +18,7 @@ class baseTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effec
         decaySteps=1500,
         epochs=50,
         batchSize=128,
+        trainingNoise=0.0,
         beta1=None,
         beta2=None,
         trackGradient=False,
@@ -39,6 +40,7 @@ class baseTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effec
         self.trackGradient = trackGradient
         self.trackActivation = trackActivation
         self.trackPerOutputGrad = trackPerOutputGrad
+        self.trainingNoise = trainingNoise
 
         self.beta1 = beta1
         self.beta2 = beta2
@@ -55,31 +57,32 @@ class baseTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effec
         for start in tqdm(range(0, X.nSamples, self.batchSize)):
             self.stats.lr.append(optimizer.param_groups[0]['lr'])
 
-            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
+            bX = X[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype).data
+            bX = bX + torch.randn_like(bX) * self.trainingNoise
             bY = Y[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
 
             optimizer.zero_grad()
 
             if self.trackActivation:
                 self._start_recording("train")
-            preds = model(bX)
+            preds = model(bX, tensorInput=True)
             if self.trackActivation:
                 self._stop_recording()
 
             if self.trackPerOutputGrad:
-                self._track_per_output_grads(model, preds.data, bY.data)
+                self._track_per_output_grads(model, preds, bY.data)
 
             # --- CALCUL DE LA LOSS PONDÉRÉE ---
             if sampleWeights is not None:
                 # On récupère le batch de poids
                 bW = sampleWeights[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
                 # On calcule la MSE par élément sans réduction
-                raw_loss = nn.functional.mse_loss(preds.data, bY.data, reduction='none')
+                raw_loss = nn.functional.mse_loss(preds, bY.data, reduction='none')
                 # On applique les poids et on fait la moyenne
                 # bW doit avoir une forme compatible pour le broadcast (ex: [batch, 1] ou [batch])
                 loss = (raw_loss * bW.data).mean()
             else:
-                loss = nn.functional.mse_loss(preds.data, bY.data)
+                loss = nn.functional.mse_loss(preds, bY.data)
 
             loss.backward()
 

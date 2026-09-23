@@ -2,11 +2,12 @@ import POLENE_GPU.databaseGeneration.models.cantera0D as cantera0D
 import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
 from POLENE_GPU.dataHandler.serie import concat
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
+from POLENE_GPU.preProcessing.scaler.BCT import boxCoxScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
 from POLENE_GPU.preProcessing.scaler.softLogScaler import softlogScaler
 from POLENE_GPU.NN.models.resNet import ResNet
 from POLENE_GPU.NN.models.adaptedResNet import ResNet as adaptedResNet
-from POLENE_GPU.NN.models.integratorNet import IntegratorNet
+from POLENE_GPU.NN.models.MLP import MLP
 from POLENE_GPU.NN.trainer.baseTrainer import baseTrainer
 from POLENE_GPU.NN.validator.oneStepPrediction import oneStepPredictionValidator
 from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
@@ -25,21 +26,21 @@ savingDdtype = torch.float64
 CPUparallelProcessing = 30  # False or number of processor used
 n_init_cond = 1000
 
-trainingDevice = torch.device('cuda:0')
+trainingDevice = torch.device('cuda:1')
 trainingDdtype = torch.float32
 
-validationDevice = torch.device('cuda:0')
+validationDevice = torch.device('cuda:1')
 validationDdtype = torch.float32
 
 JVPDtype = torch.float64
-JVPDevice = torch.device('cuda:0')
+JVPDevice = torch.device('cuda:1')
 
 mech = 'gri30.yaml'
 
 with Timer("Model creation"):
     reactormodel = cantera0D.cstP(
         kinetics=mech,
-        dtcfd=1e-7
+        dtcfd=1e-6
     )
 
 with Timer("DatabaseGenerator creation"):
@@ -62,7 +63,7 @@ with Timer("Dataset generation"):
 
 with Timer("Model creation"):
     #model = ResNet(Xdtb.nFeatures, 100, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
-    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
+    #model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
     #model = adaptedResNet(Xdtb.nFeatures, 556, 4, 260)
     #model = IntegratorNet(
     #    input_dim=Xdtb.nFeatures,
@@ -74,8 +75,8 @@ with Timer("Model creation"):
     #    layerNorm=True,
     #    activationOnOutput=False,
     #)
-    #model = ResNet(Xdtb.nFeatures, 556, 4, 260, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
-
+    model = ResNet(Xdtb.nFeatures, 556, 4, 260, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
+    #model = MLP(Xdtb.nFeatures, 6, 500, layerNorm=True)
 
 with Timer("Database scaling"):
 
@@ -84,7 +85,8 @@ with Timer("Database scaling"):
     #scaler = scaler + stdScaler()
 
     #scaler = logScaler(threshold=1e-28) + stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
-    scaler = stdScaler()
+    scaler = boxCoxScaler(lambda_=0.1) + stdScaler()
+    #scaler = stdScaler()
     #scaler = softlogScaler(threshold=1e-28, verbose=True) + stdScaler()
     Xdtb_scaled = scaler.fit_transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)
@@ -92,7 +94,7 @@ with Timer("Database scaling"):
     model.outputScaler = scaler
 
 with Timer("Trainer initialisation"):
-    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=10, decaySteps=1500, lr=5e-3)  # for the smallest network
+    trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=20, decaySteps=1500, lr=1e-3)  # for the smallest network
     #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=40, decaySteps=2000)  # for th biggest network
     #trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=50, lr=0.0009644703688222561, decaySteps=5340, decayRate=0.8772676774813501)  # for the bayesian opted adaptedResnet
 
