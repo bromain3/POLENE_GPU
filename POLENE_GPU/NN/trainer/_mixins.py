@@ -83,19 +83,27 @@ class ValidationMixin:
             for start in range(0, Xval.nSamples, self.batchSize):
                 bX = Xval[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
                 bY = Yval[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
-                preds = model(bX)
+
+                if model.predictState:
+                    preds = model(bX.data, tensorInput=True)
+
+                else:
+                    omega_hat = model(bX.data, tensorInput=True)
+                    preds_phys = model.torchOutput2State(model.inputScaler.inverse_transformTorch(bX.data), omega_hat)
+                    preds_phys = torch.clamp(preds_phys, 1e-30,None)  # TODO: study the impact of clamping value on training
+                    preds = model.inputScaler.transformTorch(preds_phys)
 
                 # --- CALCUL DE LA LOSS PONDÉRÉE ---
                 if sampleWeights is not None:
                     # On récupère le batch de poids
                     bW = sampleWeights[start:start + self.batchSize].to(self.trainingDevice).to(self.trainingDtype)
                     # On calcule la MSE par élément sans réduction
-                    raw_loss = nn.functional.mse_loss(preds.data, bY.data, reduction='none')
+                    raw_loss = nn.functional.mse_loss(preds, bY.data, reduction='none')
                     # On applique les poids et on fait la moyenne
                     # bW doit avoir une forme compatible pour le broadcast (ex: [batch, 1] ou [batch])
                     loss = (raw_loss * bW.data).mean()
                 else:
-                    loss = nn.functional.mse_loss(preds.data, bY.data)
+                    loss = nn.functional.mse_loss(preds, bY.data)
 
                 total += loss.item() * bX.data.size(0)
 

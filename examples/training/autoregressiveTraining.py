@@ -13,7 +13,6 @@ from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
 from POLENE_GPU.NN.validator.residualsAnalysis import residualAnalysisValidator
 from POLENE_GPU.misc.timer import Timer
 from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ, getScaledTransformationJExplicit, getChemicalJacobian, getTransformationJ
-from POLENE_GPU.databaseGeneration.standalone.ILDMaugmentation import sampleManifoldAugmentation
 from POLENE_GPU.databaseGeneration.standalone.trajGeneration import generateTrajectoryTargets
 import POLENE_GPU.databaseGeneration.standalone.NeuralCFD as NeuNeu
 from POLENE_GPU.exports.PYTHON import PYTHONexport
@@ -43,7 +42,7 @@ mech = 'gri30.yaml'
 with Timer("Model creation"):
     reactormodel = cantera0D.cstP(
         kinetics=mech,
-        dtcfd=1e-7
+        dtcfd=1e-6
     )
 
 
@@ -57,20 +56,21 @@ with Timer("Initial conditions sampling"):
     intiCond = dtbgen.generateInitialConditionSamples('Halton', n_init_cond)
 
 with Timer("Dataset generation"):
-    #Xdtb, Ydtb = dtbgen.generateDataset(intiCond, CPUparallelProcessing=CPUparallelProcessing)
+    Xdtb, Ydtb = dtbgen.generateDataset(intiCond, CPUparallelProcessing=CPUparallelProcessing)
 
-    dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100_1500_cells_64bits_cantera_high_num_tol.h5'
-    Xdtb, Ydtb = NeuNeu.readH5Database(dtb_path, mech)
+    #dtb_path = '../database_generation/NeuralCFD/sim_symetric_phi_1.0_T_2100_1500_cells_64bits_cantera_high_num_tol.h5'
+    #Xdtb, Ydtb = NeuNeu.readH5Database(dtb_path, mech)
 
     Ysdtb = generateTrajectoryTargets(
     Xdtb,
     seq_len=20,
-    dt=1e-7,
-    reactorType='cstV',
+    dt=1e-6,
+    reactorType='cstP',
     kinetics=mech,
     n_workers=CPUparallelProcessing)
 
-    osc_spe = ['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'] # HCO ?
+    #osc_spe = ['NNH', 'CH2(S)', 'CH', 'CH2', 'CH2OH', 'HCNN', 'C', 'C2H', 'CN', 'HCO'] # HCO ?
+    osc_spe = []
     Xdtb = Xdtb.drop(osc_spe)
     Ydtb = Ydtb.drop(osc_spe)
     for n, y in enumerate(Ysdtb):

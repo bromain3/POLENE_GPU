@@ -65,7 +65,15 @@ class baseTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effec
 
             if self.trackActivation:
                 self._start_recording("train")
-            preds = model(bX, tensorInput=True)
+
+            if model.predictState:
+                preds = model(bX, tensorInput=True)
+            else:
+                omega_hat = model(bX.data, tensorInput=True)
+                preds_phys = model.torchOutput2State(model.inputScaler.inverse_transformTorch(bX.data), omega_hat)
+                preds_phys = torch.clamp(preds_phys, 1e-30, None) #TODO: study the impact of clamping value on training
+                preds = model.inputScaler.transformTorch(preds_phys)
+
             if self.trackActivation:
                 self._stop_recording()
 
@@ -88,6 +96,7 @@ class baseTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effec
 
             if self.trackGradient:
                 self._track_grad_norms(model)  # If we want the gradient per step, we can chain rest, track and flush right here.
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
             lrScheduler.step()
 

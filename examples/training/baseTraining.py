@@ -2,6 +2,7 @@ import POLENE_GPU.databaseGeneration.models.cantera0D as cantera0D
 import POLENE_GPU.databaseGeneration.databaseGenerator as databaseGenerator
 from POLENE_GPU.dataHandler.serie import concat
 from POLENE_GPU.preProcessing.scaler.stdScaler import stdScaler
+from POLENE_GPU.preProcessing.scaler.diffStdScaler import diffStdScaler
 from POLENE_GPU.preProcessing.scaler.BCT import boxCoxScaler
 from POLENE_GPU.preProcessing.scaler.logScaler import logScaler
 from POLENE_GPU.preProcessing.scaler.softLogScaler import softlogScaler
@@ -14,7 +15,6 @@ from POLENE_GPU.NN.validator.autoregressive0D import autoregressive0DValidator
 from POLENE_GPU.NN.validator.residualsAnalysis import residualAnalysisValidator
 from POLENE_GPU.misc.timer import Timer
 from POLENE_GPU.misc.JacobianComputation import getScaledTransformationJ, getScaledTransformationJExplicit, getChemicalJacobian, getTransformationJ
-from POLENE_GPU.databaseGeneration.standalone.ILDMaugmentation import sampleManifoldAugmentation
 
 import kineticsGPU.torch.reactors.constantP as cstPreactorTorch
 
@@ -30,7 +30,7 @@ trainingDevice = torch.device('cuda:1')
 trainingDdtype = torch.float32
 
 validationDevice = torch.device('cuda:1')
-validationDdtype = torch.float32
+validationDdtype = torch.float64
 
 JVPDtype = torch.float64
 JVPDevice = torch.device('cuda:1')
@@ -63,7 +63,7 @@ with Timer("Dataset generation"):
 
 with Timer("Model creation"):
     #model = ResNet(Xdtb.nFeatures, 100, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
-    #model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
+    model = ResNet(Xdtb.nFeatures, 54, 2, 350, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  # "small" network, usually more than enough
     #model = adaptedResNet(Xdtb.nFeatures, 556, 4, 260)
     #model = IntegratorNet(
     #    input_dim=Xdtb.nFeatures,
@@ -75,7 +75,7 @@ with Timer("Model creation"):
     #    layerNorm=True,
     #    activationOnOutput=False,
     #)
-    model = ResNet(Xdtb.nFeatures, 556, 4, 260, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
+    #model = ResNet(Xdtb.nFeatures, 556, 4, 260, layerNorm=True, useBackbone=True, kaimigInit=False, activationOnOutput=False)  #  "larger" model, may be a bit more prone to overfitting with base training hyperparameters but has better pure mse precision
     #model = MLP(Xdtb.nFeatures, 6, 500, layerNorm=True)
 
 with Timer("Database scaling"):
@@ -85,13 +85,16 @@ with Timer("Database scaling"):
     #scaler = scaler + stdScaler()
 
     #scaler = logScaler(threshold=1e-28) + stdScaler() #ShiftedLogScaler(min_shift=1e-10) + stdScaler()
-    scaler = boxCoxScaler(lambda_=0.1) + stdScaler()
+    a = stdScaler()
+    scaler = boxCoxScaler(lambda_=0.1) + a
     #scaler = stdScaler()
     #scaler = softlogScaler(threshold=1e-28, verbose=True) + stdScaler()
-    Xdtb_scaled = scaler.fit_transform(Xdtb)
+    scaler = scaler.fit(Xdtb)
+    Xdtb_scaled = scaler.transform(Xdtb)
     Ydtb_scaled = scaler.transform(Ydtb)
     model.inputScaler = scaler
     model.outputScaler = scaler
+    print(a.std)
 
 with Timer("Trainer initialisation"):
     trainer = baseTrainer(trainingDtype=trainingDdtype, trainingDevice=trainingDevice, epochs=20, decaySteps=1500, lr=1e-3)  # for the smallest network
@@ -115,7 +118,7 @@ with Timer("Model validaton"):
 
 with Timer("Validator initialisation"):
     validator = autoregressive0DValidator(validationDtype=validationDdtype, validationDevice=validationDevice)
-
+    #TODO: calculer la correlation entre N2 et T et montrer qu'elle va dans le bon sens et que sa valeur est liée à la physique
 with Timer("Model validaton"):
     validator.validate(model, X, Y, tX, reactormodel.dtcfd)
 

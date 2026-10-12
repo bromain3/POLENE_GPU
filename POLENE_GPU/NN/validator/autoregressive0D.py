@@ -5,7 +5,7 @@ import numpy as np
 
 from POLENE_GPU.NN.validator._commonValidator import _commonValidator
 from POLENE_GPU.NN.models.mixtureOfExperts import MixtureOfExperts
-from POLENE_GPU.dataHandler.serie import concat
+from POLENE_GPU.dataHandler.serie import concat, serie
 
 
 class autoregressive0DValidator(_commonValidator):
@@ -19,7 +19,7 @@ class autoregressive0DValidator(_commonValidator):
 
         use_clusters = showClusters and isinstance(model, MixtureOfExperts)
 
-        preds       = [X[0]]
+        preds       = [X[0] if model.predictState else X[0].data]
         time        = [0]
         step_labels = []   # cluster label for each generated step (empty when not used)
 
@@ -33,9 +33,14 @@ class autoregressive0DValidator(_commonValidator):
                     )
                     step_labels.append(int(label[0].item()))
 
-                next_state = model.outputScaler.inverse_transform(
-                    model(model.inputScaler.transform(current))
-                )
+                if model.predictState:
+                    next_state = model.outputScaler.inverse_transform(
+                        model(model.inputScaler.transform(current))
+                    )
+                else:
+                    omega_hat = model(model.inputScaler.transformTorch(current.data.clone()), tensorInput=True)
+                    next_state = model.torchOutput2State(current.data, omega_hat)
+
                 preds.append(next_state)
                 time.append(time[-1] + dtcfd)
 
@@ -49,7 +54,11 @@ class autoregressive0DValidator(_commonValidator):
             cluster_colors = [cmap(k) for k in range(n_clusters)]
             labels_arr    = np.array(step_labels)
 
-        preds = concat(preds)
+        if model.predictState:
+            preds = concat(preds)
+        else:
+            preds = torch.concat(preds)
+            preds = serie(preds, colName=X.colName, storingDtype=self.validationDtype, storingDevice=self.validationDevice)
 
         for col in X.colName:
             fig, axs = plt.subplots(2, 1, figsize=(8, 6), sharex=True)

@@ -40,35 +40,42 @@ class _ResNet(nn.Module):
 
 class ResNet(_wrapper):
     def __init__(
-        self,
-        input_dim,
-        backbone_dim,
-        nb_blocks,
-        hidden_dim,
-        layerNorm=True,
-        useBackbone=True,
-        kaimigInit=False,
-        activationOnOutput=False,
+            self,
+            input_dim,
+            backbone_dim,
+            nb_blocks,
+            hidden_dim,
+            output_dim=None,  # ← nouveau, None = comportement inchangé (output_dim = input_dim)
+            layerNorm=True,
+            useBackbone=True,
+            kaimigInit=False,
+            activationOnOutput=False,
+            predictState=True,
+            chemScaler=None,
+            chemStdScaler=None
     ):
         nn.Module.__init__(self)
-        _wrapper.__init__(self)
+        _wrapper.__init__(self, predictState, chemScaler, chemStdScaler)
 
-        self.bck              = backbone_dim
-        self.nb_blocks        = nb_blocks
-        self.dim              = hidden_dim
-        self.input_dim        = input_dim
-        self.useBackbone      = useBackbone
-        self.layerNorm        = layerNorm
+        if output_dim is None:
+            output_dim = input_dim
+
+        self.bck = backbone_dim
+        self.nb_blocks = nb_blocks
+        self.dim = hidden_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.useBackbone = useBackbone
+        self.layerNorm = layerNorm
         self.activationOnOutput = activationOnOutput
 
         if useBackbone:
-            self.backbone     = nn.Linear(input_dim, backbone_dim)
-            self.backbone_act = nn.SiLU()   # ← module nommé : hookable
-            self.resnet       = _ResNet(backbone_dim, nb_blocks, hidden_dim,
-                                        layerNorm=layerNorm,
-                                        activationOnOutput=activationOnOutput)
-            self.output_layer = nn.Linear(backbone_dim, input_dim)
-            # net reste utilisé pour le forward — on garde la séquence lisible
+            self.backbone = nn.Linear(input_dim, backbone_dim)
+            self.backbone_act = nn.SiLU()
+            self.resnet = _ResNet(backbone_dim, nb_blocks, hidden_dim,
+                                  layerNorm=layerNorm,
+                                  activationOnOutput=activationOnOutput)
+            self.output_layer = nn.Linear(backbone_dim, output_dim)  # ← était input_dim
             self.net = nn.Sequential(
                 self.backbone,
                 self.backbone_act,
@@ -76,23 +83,25 @@ class ResNet(_wrapper):
                 self.output_layer,
             )
         else:
-            backbone_dim  = input_dim
-            self.resnet   = _ResNet(backbone_dim, nb_blocks, hidden_dim,
-                                    layerNorm=layerNorm,
-                                    activationOnOutput=activationOnOutput)
-            self.net      = self.resnet
+            backbone_dim = input_dim
+            self.resnet = _ResNet(backbone_dim, nb_blocks, hidden_dim,
+                                  layerNorm=layerNorm,
+                                  activationOnOutput=activationOnOutput)
+            self.output_layer = nn.Linear(backbone_dim, output_dim)  # ← nouveau : n'existait pas
+            self.net = nn.Sequential(self.resnet, self.output_layer)  # ← était juste self.resnet
 
         if kaimigInit:
             self.kaimig_init_weights()
 
     def _get_config(self):
         return {
-            "input_dim":          self.input_dim,
-            "backbone_dim":       self.bck,
-            "nb_blocks":          self.nb_blocks,
-            "hidden_dim":         self.dim,
-            "layerNorm":          self.layerNorm,
-            "useBackbone":        self.useBackbone,
+            "input_dim": self.input_dim,
+            "backbone_dim": self.bck,
+            "nb_blocks": self.nb_blocks,
+            "hidden_dim": self.dim,
+            "output_dim": self.output_dim,  # ← nouveau
+            "layerNorm": self.layerNorm,
+            "useBackbone": self.useBackbone,
             "activationOnOutput": self.activationOnOutput,
         }
 
@@ -124,8 +133,8 @@ class ResNet(_wrapper):
         if self.useBackbone:
             for p in self.backbone.parameters():
                 p.requires_grad = True
-            for p in self.output_layer.parameters():
-                p.requires_grad = True
+        for p in self.output_layer.parameters():
+            p.requires_grad = True
         for p in self.resnet.parameters():
             p.requires_grad = True
 

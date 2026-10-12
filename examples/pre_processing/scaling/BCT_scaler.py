@@ -19,7 +19,7 @@ with Timer("Model creation"):
 
 
 with Timer("Scaler creation"):
-    scaler = boxCoxScaler(lambda_=0.2)
+    scaler = boxCoxScaler(lambda_=0.05, threshold=0.0)
 
 with Timer("Single trajectory"):
     X, Y, tX, tY = dtbgen.generateSingleTrajectory({'T': 1700, 'P': 101325, 'phi': 1.0})

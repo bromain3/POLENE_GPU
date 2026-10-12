@@ -25,6 +25,8 @@ class autoregressiveTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsS
         trackPerOutputGrad=False,
         trainingDevice=None,
         trainingDtype=None,
+        lossMode='state',            # 'state': loss sur la reconstruction des états | 'increment': loss cumulée sur les incréments
+        backpropThroughTime=True,    # False: on détache l'état entre deux pas du rollout
     ):
         _statsSave.__init__(self)
         self.testSize = testSize
@@ -43,25 +45,83 @@ class autoregressiveTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsS
         self.beta1 = beta1
         self.beta2 = beta2
 
+        if lossMode not in ('state', 'increment'):
+            raise ValueError("lossMode must be 'state' or 'increment'")
+        self.lossMode = lossMode
+        self.backpropThroughTime = backpropThroughTime
+
+    def _step(self, model, x):
+        """Un pas autorégressif pour un modèle qui prédit l'incrément.
+        x : tenseur d'état scalé. Retourne (omega_hat, x_next scalé)."""
+        omega_hat = model(x, tensorInput=True)
+        x_phys = model.inputScaler.inverse_transformTorch(x)
+        state_phys = model.torchOutput2State(x_phys, omega_hat)
+        state_phys = torch.clamp(state_phys, 1e-15, None)  # TODO: study the impact of clamping value on training
+        x_next = model.inputScaler.transformTorch(state_phys)
+        return omega_hat, x_next
+
+    @torch.no_grad()
+    def _trueIncrements(self, model, x0, bY):
+        """Incréments cibles dans l'espace de sortie du modèle (BCT puis outputScaler),
+        calculés à partir des états vrais.
+        x0 : (B, F) état initial scalé ; bY : (B, T, F) états vrais scalés."""
+        B, T, F = bY.shape
+        prev = torch.cat([x0.unsqueeze(1), bY[:, :-1]], dim=1)      # y_{k-1} vrai
+        # inputScaler = BCT + std  ->  chemStdScaler.inverse donne l'espace BCT
+        z_prev = model.chemStdScaler.inverse_transformTorch(prev.reshape(-1, F))
+        z_next = model.chemStdScaler.inverse_transformTorch(bY.reshape(-1, F))
+        inc = model.outputScaler.transformTorch(z_next - z_prev)
+        return inc.reshape(B, T, F)
+
     def autoregLoss(self, model, bX, bY):
         seq_len = bY.shape[1]
 
-        pred = bX
-        preds = []
+        # --- modèles qui prédisent directement l'état : comportement inchangé ---
+        if model.predictState:
+            pred = bX
+            preds = []
+            for _ in range(seq_len):
+                if self.trackActivation:
+                    self._start_recording("train")
+                pred = model(pred)
+                if self.trackActivation:
+                    self._stop_recording()
+                preds.append(pred.data)
+            preds = torch.stack(preds, dim=1)
+            if self.trackPerOutputGrad:
+                self._track_per_output_grads(model, preds, bY)
+            return nn.functional.mse_loss(preds, bY)
+
+        # --- modèles qui prédisent l'incrément ---
+        x = bX.data
+        x0 = x
+        omegas, states = [], []
         for _ in range(seq_len):
             if self.trackActivation:
                 self._start_recording("train")
-            pred = model(pred)
+            omega_hat, x = self._step(model, x)
             if self.trackActivation:
                 self._stop_recording()
-            preds.append(pred.data)
-        preds = torch.stack(preds, dim=1)
+            omegas.append(omega_hat)
+            states.append(x)
+            if not self.backpropThroughTime:
+                x = x.detach()
 
+        omegas = torch.stack(omegas, dim=1)   # (B, T, F)
+        states = torch.stack(states, dim=1)   # (B, T, F)
+
+        if self.lossMode == 'increment':
+            # erreur sur chaque incrément, cumulée sur le rollout
+            # (l'entrée du pas k est l'état reconstruit au pas k-1, donc l'erreur s'accumule via le rollout)
+            targets = self._trueIncrements(model, x0, bY)
+            if self.trackPerOutputGrad:
+                self._track_per_output_grads(model, omegas, targets)
+            return nn.functional.mse_loss(omegas, targets)  #TODO: work on that cause it is strange that on one step pred we have 0.01 loss and on multiple steps we have 1e-4 loss
+
+        # lossMode == 'state' : on compare les états reconstruits aux états vrais
         if self.trackPerOutputGrad:
-            self._track_per_output_grads(model, preds, bY)
-
-        loss = nn.functional.mse_loss(preds, bY)
-        return(loss)
+            self._track_per_output_grads(model, states, bY)
+        return nn.functional.mse_loss(states, bY)
 
     def __trainingPhase(self, X, Ys, model, optimizer, lrScheduler):
         model.train()

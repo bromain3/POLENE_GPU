@@ -36,9 +36,9 @@ class _MLP(nn.Module):
         return(self.network(x))
 
 class MLP(_wrapper):
-    def __init__(self, input_dim, nb_layers, hidden_dim, layerNorm=True):
+    def __init__(self, input_dim, nb_layers, hidden_dim, layerNorm=True, predictState=True, chemScaler=None, chemStdScaler=None):
         nn.Module.__init__(self)
-        _wrapper.__init__(self)
+        _wrapper.__init__(self, predictState, chemScaler, chemStdScaler)
 
         self.input = nn.Linear(input_dim, hidden_dim)
         self.input_act = nn.SiLU()

@@ -43,9 +43,12 @@ class ResNet(_wrapper):
         hidden_dim,
         layerNorm=True,
         useBackbone=True,
+        predictState=True,
+        chemScaler=None,
+        chemStdScaler=None
     ):
         nn.Module.__init__(self)
-        _wrapper.__init__(self)
+        _wrapper.__init__(self, predictState, chemScaler, chemStdScaler)
 
         self.bck              = backbone_dim
         self.nb_blocks        = nb_blocks

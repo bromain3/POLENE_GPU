@@ -52,9 +52,9 @@ class _DNN(nn.Module):
 
 class DNN6HL(_wrapper):
 
-    def __init__(self, input_dim=53, layerNorm=False):
+    def __init__(self, input_dim=53, layerNorm=False, predictState=True, chemScaler=None, chemStdScaler=None):
         nn.Module.__init__(self)
-        _wrapper.__init__(self)
+        _wrapper.__init__(self, predictState, chemScaler, chemStdScaler)
 
         hidden_dims = [
             200,

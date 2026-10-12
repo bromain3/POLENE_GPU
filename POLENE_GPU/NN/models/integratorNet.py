@@ -5,138 +5,170 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _MLP(nn.Module):
-    """MLP générique : nb_layers couches cachées de taille hidden_dim."""
-    def __init__(self, input_dim, output_dim, nb_layers, hidden_dim, layerNorm=False, activationOnOutput=True):
-        super().__init__()
-        self.activationOnOutput = activationOnOutput
-
-        layers = []
-        in_dim = input_dim
-        for _ in range(nb_layers):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            if layerNorm:
-                layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.SiLU())
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, output_dim))
-
-        self.net = nn.Sequential(*layers)
-        self._out_act = F.silu if activationOnOutput else (lambda x: x)
-
-    def forward(self, x):
-        return self._out_act(self.net(x))
-
-
-class IntegratorNet(_wrapper):
+class ComposedSourceIntegratorNet(_wrapper):
     """
-    Architecture inspirée d'un intégrateur à deux branches :
+    Compose deux réseaux indépendants pour l'entraînement en deux temps :
 
-        x ──────────────────────────────────────────► [identity branch]
-         │                                                     │
-         └──► [source_branch : MLP(input_dim → source_dim)] ──┤
-                                                               │
-                                                    concat(x, source)
-                                                               │
-                                                    [integrator : MLP → input_dim]
-                                                               │
-                                                             output
+        x (TPY) ──► [sourceNet] ──► omega_hat
+         │                              │
+         └──────► concat(x, omega_hat) ─┤
+                                         ▼
+                                 [integratorNet] ──► output (TPY(t+dt) scalé)
 
-    Args:
-        input_dim      : taille de x
-        source_dim     : taille de la sortie de la branche source
-        source_layers  : profondeur du MLP source (nb couches cachées)
-        source_width   : largeur du MLP source
-        integrator_layers : profondeur du MLP intégrateur
-        integrator_width  : largeur du MLP intégrateur
-        layerNorm      : active LayerNorm dans les deux MLPs
-        activationOnOutput : applique SiLU sur la sortie finale
-        kaimingInit    : initialisation Kaiming
+    - sourceNet      : prédit les termes sources omega. Généralement
+                        pré-entraîné séparément puis gelé (freeze_source=True).
+    - integratorNet  : prend concat(TPY, omega_hat) et prédit TPY(t+dt).
+                        Entraîné from scratch (freeze_integrator=False).
+
+    sourceNet et integratorNet peuvent être n'importe quel nn.Module. S'ils
+    exposent torchForward (cas des sous-classes de _wrapper), elle est
+    utilisée directement pour éviter l'ambiguïté de forward(serie, tensorInput)
+    défini par _wrapper. Sinon net(x) est appelé normalement.
+
+    predictState doit rester True : integratorNet produit directement l'état
+    TPY reconstruit (pas un résidu omega), donc le pipeline standard de
+    baseTrainer (`if model.predictState: preds = model(bX, tensorInput=True)`)
+    s'applique tel quel, sans toucher au trainer.
     """
 
     def __init__(
         self,
-        input_dim,
-        source_dim,
-        source_layers,
-        source_width,
-        integrator_layers,
-        integrator_width,
-        layerNorm=False,
-        activationOnOutput=False,
-        kaimingInit=False,
+        sourceNet,
+        integratorNet,
+        freeze_source=True,
+        freeze_integrator=False,
+        predictState=True,
+        chemScaler=None,
+        chemStdScaler=None,
     ):
         nn.Module.__init__(self)
-        _wrapper.__init__(self)
+        _wrapper.__init__(self, predictState, chemScaler, chemStdScaler)
 
-        self.input_dim         = input_dim
-        self.source_dim        = source_dim
-        self.source_layers     = source_layers
-        self.source_width      = source_width
-        self.integrator_layers = integrator_layers
-        self.integrator_width  = integrator_width
-        self.layerNorm         = layerNorm
-        self.activationOnOutput = activationOnOutput
+        if not predictState:
+            raise ValueError(
+                "ComposedSourceIntegratorNet ne supporte que predictState=True : "
+                "la sortie de integratorNet est déjà l'état reconstruit, pas un résidu."
+            )
 
-        # Branche source : x → termes sources
-        self.source_branch = _MLP(
-            input_dim=input_dim,
-            output_dim=source_dim,
-            nb_layers=source_layers,
-            hidden_dim=source_width,
-            layerNorm=layerNorm,
-            activationOnOutput=True,   # activation interne toujours active
-        )
+        self.sourceNet = sourceNet
+        self.integratorNet = integratorNet
 
-        # Branche intégrateur : concat(x, source) → output de taille input_dim
-        self.integrator = _MLP(
-            input_dim=input_dim + source_dim,
-            output_dim=input_dim,
-            nb_layers=integrator_layers,
-            hidden_dim=integrator_width,
-            layerNorm=layerNorm,
-            activationOnOutput=activationOnOutput,
-        )
+        self.freeze_source = False
+        self.freeze_integrator = False
+        self.enableFineTuning(freeze_source=freeze_source, freeze_integrator=freeze_integrator)
 
-        if kaimingInit:
-            self.kaiming_init_weights()
+    # ---- gel / dégel ------------------------------------------------------
+
+    @staticmethod
+    def _setRequiresGrad(module, flag):
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def enableFineTuning(self, freeze_source=False, freeze_integrator=False):
+        """
+        Gèle (True) ou dégèle (False) chaque sous-réseau : coupe/rétablit
+        requires_grad ET bascule train()/eval() en conséquence, pour que les
+        couches sensibles au mode (Dropout, BatchNorm...) se comportent
+        correctement. L'état est ensuite préservé automatiquement par la
+        surcharge de train() ci-dessous, même quand le trainer appelle
+        model.train() sur l'ensemble à chaque époque.
+
+        Peut être rappelée entre deux entraînements successifs pour changer
+        la stratégie de gel (ex: dégeler sourceNet pour du fine-tuning joint
+        après une première phase) — _build_optimizer reconstruira alors un
+        optimizer qui inclut les paramètres nouvellement entraînables.
+        """
+        self.freeze_source = freeze_source
+        self.freeze_integrator = freeze_integrator
+
+        self._setRequiresGrad(self.sourceNet, not freeze_source)
+        self._setRequiresGrad(self.integratorNet, not freeze_integrator)
+
+        self.sourceNet.train(not freeze_source)
+        self.integratorNet.train(not freeze_integrator)
+
+    def disableFineTuning(self):
+        """Dégèle tout (les deux sous-réseaux redeviennent entraînables)."""
+        self.enableFineTuning(freeze_source=False, freeze_integrator=False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.sourceNet.train(mode and not self.freeze_source)
+        self.integratorNet.train(mode and not self.freeze_integrator)
+        return self
+
+    # ---- forward ------------------------------------------------------------
+
+    @staticmethod
+    def _forwardSubnet(net, x):
+        if hasattr(net, "torchForward"):
+            return net.torchForward(x)
+        return net(x)
+
+    def torchForward(self, x):
+        if self.freeze_source:
+            with torch.no_grad():
+                omega_hat = self._forwardSubnet(self.sourceNet, x)
+        else:
+            omega_hat = self._forwardSubnet(self.sourceNet, x)
+
+        fused = torch.cat([x, omega_hat], dim=-1)
+        return self._forwardSubnet(self.integratorNet, fused)
+
+    # ---- config / persistance ------------------------------------------------
 
     def _get_config(self):
+        # sourceNet/integratorNet sont des nn.Module arbitraires, non
+        # reconstructibles depuis un simple dict scalaire (contrairement à
+        # ce que suppose _wrapper._from_config pour un modèle "feuille").
+        # On ne sauvegarde donc que l'état de gel ; la reconstruction de
+        # l'architecture est à la charge de l'appelant via load()/
+        # fromPretrainedSource() ci-dessous.
         return {
-            "input_dim":          self.input_dim,
-            "source_dim":         self.source_dim,
-            "source_layers":      self.source_layers,
-            "source_width":       self.source_width,
-            "integrator_layers":  self.integrator_layers,
-            "integrator_width":   self.integrator_width,
-            "layerNorm":          self.layerNorm,
-            "activationOnOutput": self.activationOnOutput,
+            "freeze_source": self.freeze_source,
+            "freeze_integrator": self.freeze_integrator,
         }
 
     @classmethod
     def _from_config(cls, config):
-        return cls(**config)
+        raise NotImplementedError(
+            "ComposedSourceIntegratorNet ne peut pas être reconstruit depuis sa "
+            "seule config : instancie sourceNet/integratorNet toi-même et utilise "
+            "load(path, sourceNet, integratorNet) ou fromPretrainedSource(...)."
+        )
 
-    def kaiming_init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+    @classmethod
+    def load(cls, path, sourceNet, integratorNet):
+        """
+        Signature différente de _wrapper.load(path) à dessein : sourceNet et
+        integratorNet doivent être instanciés par l'appelant (même
+        architecture qu'au moment du save), puis load_state_dict restaure
+        les poids des deux sous-réseaux.
+        """
+        checkpoint = torch.load(path, weights_only=False)
+        cfg = checkpoint["config"]
+        model = cls(
+            sourceNet, integratorNet,
+            freeze_source=cfg["freeze_source"],
+            freeze_integrator=cfg["freeze_integrator"],
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.inputScaler  = pickle.loads(checkpoint["scalers"]["input"])
+        model.outputScaler = pickle.loads(checkpoint["scalers"]["output"])
+        return model
 
-    def enableFineTuning(self, freeze_source=False, freeze_integrator=False):
-        if freeze_source:
-            for p in self.source_branch.parameters():
-                p.requires_grad = False
-        if freeze_integrator:
-            for p in self.integrator.parameters():
-                p.requires_grad = False
+    @classmethod
+    def fromPretrainedSource(
+        cls, sourceNetClass, sourceNetPath, integratorNet,
+        freeze_source=True, freeze_integrator=False,
+    ):
+        """
+        Raccourci pour ton workflow : sourceNet a déjà été entraîné et
+        sauvegardé séparément (typiquement un _wrapper avec predictState=False
+        prédisant omega), integratorNet est neuf (poids aléatoires).
 
-    def disableFineTuning(self):
-        for p in self.parameters():
-            p.requires_grad = True
-
-    def torchForward(self, x):
-        source = self.source_branch(x)            # branche source : f(x)
-        fused  = torch.cat([x, source], dim=-1)   # identité + source
-        return self.integrator(fused)             # "intégration"
+        sourceNetClass doit implémenter _from_config/_get_config (interface
+        _wrapper standard) pour que .load() fonctionne.
+        """
+        sourceNet = sourceNetClass.load(sourceNetPath)
+        return cls(sourceNet, integratorNet, freeze_source=freeze_source, freeze_integrator=freeze_integrator)

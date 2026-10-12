@@ -99,6 +99,40 @@ def _draw(rng, distribution, scale, size=None):
             f"distribution doit être 'uniform' ou 'gaussian', reçu '{distribution}'"
         )
 
+def _perturb_pressure(P, rng, mode, size, distribution, max_resample=100):
+    """
+    Perturbe un vecteur de pressions P (Pa) pour émuler les variations de
+    pression extérieures dues au solveur CFD.
+        - mode == 'multiplicative' : P' = P * (1 + size * c)   (size sans unité)
+        - mode == 'additive'       : P' = P + size * c         (size en Pa)
+    avec c tiré selon `distribution` ('uniform' -> U(-1,1), 'gaussian' -> N(0,1)).
+    Les tirages donnant P' <= 0 sont retirés (resampling).
+    """
+    if mode is None or size == 0.0:
+        return P
+    if mode not in ('multiplicative', 'additive'):
+        raise ValueError(
+            f"P_perturbation_mode doit être None, 'multiplicative' ou 'additive', reçu '{mode}'"
+        )
+    P_new = P.copy()
+    todo = np.arange(len(P))
+    for _ in range(max_resample):
+        if todo.size == 0:
+            break
+        c = _draw(rng, distribution, 1.0, size=todo.size)
+        if mode == 'multiplicative':
+            cand = P[todo] * (1.0 + size * c)
+        else:
+            cand = P[todo] + size * c
+        ok = cand > 0.0
+        P_new[todo[ok]] = cand[ok]
+        todo = todo[~ok]
+    if todo.size > 0:
+        raise RuntimeError(
+            "Impossible d'obtenir des pressions strictement positives : "
+            "P_perturbation_size est trop grand."
+        )
+    return P_new
 
 # --------------------------------------------------------------------------- #
 #  Workers pour l'intégration Cantera (labels Y)                             #
@@ -337,7 +371,10 @@ def randomizedDatasetGeneration(
     b_coef: float = 5.0,                       # Ding, Eq. (6) -- non redéfini par Liu
     max_attempts: int = 10,                    # Ding -- non redéfini par Liu
     T_ref_sensible: float = 298.15,            # !!! non précisé par Ding ni Liu
-    distribution: str = 'uniform',             # 'uniform' (Ding/Liu) ou 'gaussian' (extension)
+    distribution: str = 'uniform',             # 'uniform' (Ding/Liu) ou 'gaussian' (extension)*
+    P_perturbation_mode: str | None = None,    # None, 'multiplicative' ou 'additive'
+    P_perturbation_size: float = 0.0,          # multiplicatif : fraction (0.05 = ±5%) ; additif : Pa
+    P_perturbation_distribution: str | None = None,  # None -> même loi que `distribution`
     minmax_sample_size: int | None = None,
     n_workers: int | None = None,
     chunksize: int = 50,
@@ -387,6 +424,17 @@ def randomizedDatasetGeneration(
         Loi de tirage des variables aléatoires c (Eq. 5) et c_species
         (Eqs. 6-7) : 'uniform' (U(-1,1), valeur de Ding/Liu, défaut) ou
         'gaussian' (N(0,1), extension non spécifiée par les deux articles).
+    P_perturbation_mode : None, 'multiplicative' ou 'additive'
+        Perturbation supplémentaire de P appliquée sur l'échantillon accepté,
+        APRES tout le calcul de randomisation (identique en cstP et cstV) et
+        AVANT l'intégration. Émule les variations de pression extérieures
+        dues au solveur CFD. None -> aucune perturbation.
+    P_perturbation_size : float
+        Amplitude de la perturbation. Multiplicatif : P' = P*(1 + size*c)
+        (size sans unité, ex. 0.05 pour ±5 %). Additif : P' = P + size*c
+        (size en Pa). c ~ U(-1,1) ou N(0,1) selon la loi choisie.
+    P_perturbation_distribution : str ou None
+        'uniform' ou 'gaussian'. None -> reprend `distribution`.
     minmax_sample_size : int ou None
         Sous-échantillonnage de X pour le calcul des bornes de l'énergie
         sensible (Eq. 5). None -> calcul sur X entière.
@@ -399,6 +447,19 @@ def randomizedDatasetGeneration(
     """
     if distribution not in ('uniform', 'gaussian'):
         raise ValueError(f"distribution doit être 'uniform' ou 'gaussian', reçu '{distribution}'")
+
+    if P_perturbation_mode not in (None, 'multiplicative', 'additive'):
+        raise ValueError(
+            f"P_perturbation_mode doit être None, 'multiplicative' ou 'additive', "
+            f"reçu '{P_perturbation_mode}'"
+        )
+    if P_perturbation_distribution is None:
+        P_perturbation_distribution = distribution
+    if P_perturbation_distribution not in ('uniform', 'gaussian'):
+        raise ValueError(
+            f"P_perturbation_distribution doit être 'uniform' ou 'gaussian', "
+            f"reçu '{P_perturbation_distribution}'"
+        )
 
     col_names = X.colName
     states = X.data.cpu().detach().numpy()  # (N, nCols)
@@ -460,6 +521,17 @@ def randomizedDatasetGeneration(
     pbar.close()
 
     X_new = np.array(accepted[:n_target])
+
+    # --- perturbation supplémentaire de P (émulation du solveur CFD) ---
+    # Appliquée après toute la randomisation, en cstP comme en cstV.
+    # T et Y restent inchangés ; l'intégration part de (T, P', Y).
+    if P_perturbation_mode is not None and P_perturbation_size != 0.0:
+        X_new[:, 1] = _perturb_pressure(
+            X_new[:, 1], rng_master, P_perturbation_mode,
+            P_perturbation_size, P_perturbation_distribution,
+        )
+        print(f"[randomizedDatasetGeneration] Perturbation de P ({P_perturbation_mode}, "
+              f"size={P_perturbation_size}, loi='{P_perturbation_distribution}') appliquée.")
 
     # --- intégration directe Cantera pour obtenir les labels Y ---
     with Pool(processes=n_workers, initializer=_integration_worker_init,

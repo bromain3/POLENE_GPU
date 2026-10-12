@@ -19,7 +19,11 @@ class oneStepPredictionValidator(_commonValidator):
         use_clusters = showClusters and isinstance(model, MixtureOfExperts)
 
         with torch.no_grad():
-            preds = model.outputScaler.inverse_transform(model(model.inputScaler.transform(X)))
+            if model.predictState:
+                preds = model.outputScaler.inverse_transform(model(model.inputScaler.transform(X)))
+            else:
+                omega_hat = model(model.inputScaler.transform(X))
+                preds = model.output2State(X, omega_hat)
 
             if use_clusters:
                 labels = model.predict_cluster(model.inputScaler.transform(X))

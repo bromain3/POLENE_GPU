@@ -20,8 +20,17 @@ class residualAnalysisValidator(_commonValidator):
         use_clusters = showClusters and isinstance(model, MixtureOfExperts)
 
         with torch.no_grad():
-            Y_norm = model.outputScaler.transform(Y)
-            Y_hat_norm = model(model.inputScaler.transform(X))  # shape [N, n_out]
+            if model.predictState:
+                Y_norm = model.outputScaler.transform(Y)
+                Y_hat_norm = model(model.inputScaler.transform(X))  # shape [N, n_out]
+
+            else:
+                # We admit in the case that we predict omega that the right scaler for comparing states values is the input scaler
+                Y_norm = model.inputScaler.transform(Y)
+
+                omega_hat = model(model.inputScaler.transform(X))
+                Y_hat = model.output2State(X, omega_hat)
+                Y_hat_norm = model.inputScaler.transform(Y_hat)
 
             labels = None
             n_clusters = None

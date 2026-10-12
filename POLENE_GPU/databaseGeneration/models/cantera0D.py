@@ -11,6 +11,19 @@ def phi2Y(phi):
     Y = {'CH4': phi * mch4_mo2_st * 2 * MMO2, 'O2': 2 * MMO2, 'N2': 2 * MMO2 * O2_N2}
     return (Y)
 
+def phi2Y_H2(phi):
+    MMH2 = 2.016
+    MMO2 = 31.999
+
+    h2_o2_st = 2 * MMH2 / (2 * MMO2)
+
+    Y = {
+        'H2': phi * h2_o2_st * 2 * MMO2,
+        'O2': 2 * MMO2
+    }
+
+    return Y
+
 class __canteraReactorGenerator:
     def __init__(self, kinetics='gri30.yaml', dtcfd=1e-6, tmax=1e-3, equilibriumTolerance=1e-4, cstSamplingdt=False, samplingRange=None, limitMaxTimeStep=True):
         self.cstSamplingdt = cstSamplingdt

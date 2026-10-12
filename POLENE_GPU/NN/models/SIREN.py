@@ -47,9 +47,10 @@ class SIREN(_wrapper):
         hidden_dim,
         nb_layers,
         w0_initial=30.0,
-        w0=1.0
+        w0=1.0,
+        predictState=True, chemScaler=None, chemStdScaler=None
     ):
-        super().__init__()
+        super().__init__(predictState, chemScaler, chemStdScaler)
 
         layers = []
 

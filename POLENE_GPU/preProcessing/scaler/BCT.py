@@ -5,7 +5,7 @@ import torch
 
 
 class boxCoxScaler(_BaseTransform):
-    def __init__(self, threshold=0.0, lambda_=0.1):
+    def __init__(self, threshold=1e-30, lambda_=0.1):
         if lambda_ == 0:
             raise ValueError(
                 "boxCoxScaler does not support lambda=0 (this degenerates to the "
@@ -50,6 +50,9 @@ class boxCoxScaler(_BaseTransform):
         )
         return out
 
+
+############################################
+    #TODO: try to understand the impact of the threshold and of the clamping on grandient propagation and on autoregressive use
     def _forward(self, data):
         out = data.clone()
         t = self._threshold_tensor(data.device, data.dtype)
@@ -63,12 +66,13 @@ class boxCoxScaler(_BaseTransform):
     def _backward(self, data):
         out = data.clone()
         lam = self.lambda_
-
         col = data[:, self._species_mask]
-        # x = (lambda * y + 1) ** (1 / lambda)
         base = lam * col + 1.0
+        base = torch.clamp(base, min=1e-30)  # évite pow() sur base négative/nulle #TODO: saise une erreur ou warning si on clamp réellement, ça veut dire qu'on sort du domaine de la trasformation box cox
         out[:, self._species_mask] = base.pow(1.0 / lam)
         return out
+#########################################
+
 
     def fit(self, x):
         if x.data.dim() != 2:
