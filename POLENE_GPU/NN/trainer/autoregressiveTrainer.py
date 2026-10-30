@@ -50,14 +50,35 @@ class autoregressiveTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsS
         self.lossMode = lossMode
         self.backpropThroughTime = backpropThroughTime
 
+        self._zmin = None  # borne inférieure dans l'espace BCT (construite paresseusement)
+
+    def _getZmin(self, model, ref):
+        """Borne inférieure dans l'espace BCT, équivalent du clamp physique à 1e-50.
+        Construite en passant 1e-50 dans le chemScaler lui-même, ce qui reproduit exactement
+        son comportement numérique (seuil, underflow float32, ...). Les colonnes non-espèces
+        (T, P, ...) ne sont pas bornées (-inf). Calculée une seule fois, mise en cache."""
+        if self._zmin is None or self._zmin.device != ref.device or self._zmin.dtype != ref.dtype:
+            with torch.no_grad():
+                probe = torch.full((1, ref.shape[-1]), 1e-50, device=ref.device, dtype=ref.dtype)
+                zmin = model.chemScaler.transformTorch(probe)
+                mask = model.chemScaler._species_mask.to(ref.device)
+                self._zmin = torch.where(
+                    mask, zmin, torch.full_like(zmin, float('-inf'))
+                )
+        return self._zmin
+
     def _step(self, model, x):
         """Un pas autorégressif pour un modèle qui prédit l'incrément.
-        x : tenseur d'état scalé. Retourne (omega_hat, x_next scalé)."""
+        x : tenseur d'état scalé. Retourne (omega_hat, x_next scalé).
+
+        Tout se passe directement dans l'espace BCT : inputScaler = BCT + std, donc
+        chemStdScaler.inverse(x) donne déjà z = BCT(y). L'incrément s'y ajoute, et le
+        passage par l'espace physique (BCT^-1 puis BCT) serait l'identité aux clamps près."""
         omega_hat = model(x, tensorInput=True)
-        x_phys = model.inputScaler.inverse_transformTorch(x)
-        state_phys = model.torchOutput2State(x_phys, omega_hat)
-        state_phys = torch.clamp(state_phys, 1e-15, None)  # TODO: study the impact of clamping value on training
-        x_next = model.inputScaler.transformTorch(state_phys)
+        z = model.chemStdScaler.inverse_transformTorch(x)                    # espace BCT
+        z_next = z + model.outputScaler.inverse_transformTorch(omega_hat)    # + incrément
+        z_next = torch.clamp(z_next, min=self._getZmin(model, z_next))       # remplace le clamp phys à 1e-50  # TODO: study the impact of clamping value on training
+        x_next = model.chemStdScaler.transformTorch(z_next)
         return omega_hat, x_next
 
     @torch.no_grad()
@@ -209,6 +230,7 @@ class autoregressiveTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsS
 
 
         model.to(self.trainingDevice).to(self.trainingDtype)
+        self._zmin = None  # reconstruit au premier pas avec le bon device/dtype/scaler
         optimizer, lrScheduler = self._build_optimizer(model, self.beta1, self.beta2)
 
         self.stats.ranks.append(self.compute_effective_ranks(model))

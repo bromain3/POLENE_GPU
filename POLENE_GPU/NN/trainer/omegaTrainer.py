@@ -67,7 +67,7 @@ class omegaTrainer(SchedulerMixin, SplitMixin, ValidationMixin, _statsSave, Effe
                 self._start_recording("train")
 
             if model.predictState:
-                #TODO: vastly improve that by using all precomputed values and descale only the non bst scaler
+                #TODO: vastly improve that by using all precomputed values and descale only the non bct scaler
                 states = model(bX, tensorInput=True)
                 states_phys = model.inputScaler.inverse_transformTorch(states)
                 X_phys = model.inputScaler.inverse_transformTorch(bX)

@@ -75,7 +75,7 @@ class MixtureOfExperts(_wrapper):
         Defaults to identityScaler() (raw-input routing).
     """
 
-    def __init__(self, experts: list, clusterer, clustering_scaler=None):
+    def __init__(self, experts: list, clusterer, clustering_scaler=None, omegaBasedNets=False):
         nn.Module.__init__(self)
         _wrapper.__init__(self)
 
@@ -86,6 +86,7 @@ class MixtureOfExperts(_wrapper):
         self.clusterer         = clusterer
         self.n_experts         = len(experts)
         self.clustering_scaler = clustering_scaler if clustering_scaler is not None else identityScaler()
+        self.omegaBasedNets = omegaBasedNets
 
         # Cluster centres as a buffer so .to(device) moves them automatically
         centres = torch.tensor(
@@ -124,9 +125,14 @@ class MixtureOfExperts(_wrapper):
                 continue
 
             x_sub    = x[mask]
-            x_scaled = expert.inputScaler.transformTorch(x_sub)
-            y_scaled = expert(x_scaled, tensorInput=True)
-            output[mask] = expert.outputScaler.inverse_transformTorch(y_scaled)
+            if not self.omegaBasedNets:
+                x_scaled = expert.inputScaler.transformTorch(x_sub)
+                y_scaled = expert(x_scaled, tensorInput=True)
+                output[mask] = expert.outputScaler.inverse_transformTorch(y_scaled)
+            else:
+                x_scaled = expert.inputScaler.transformTorch(x_sub)
+                omegaScaled = expert(x_scaled, tensorInput=True)
+                output[mask] = expert.torchOutput2State(x_sub, omegaScaled)
 
         return output
 
@@ -181,6 +187,7 @@ class MixtureOfExperts(_wrapper):
             "expert_payloads":   expert_payloads,
             "clusterer":         pickle.dumps(self.clusterer),
             "clustering_scaler": pickle.dumps(self.clustering_scaler),
+            "omegaBasedNets": self.omegaBasedNets,
         }
 
     @classmethod
@@ -200,7 +207,7 @@ class MixtureOfExperts(_wrapper):
             expert.outputScaler = pickle.loads(payload["scalers"]["output"])
             experts.append(expert)
 
-        return cls(experts, clusterer, clustering_scaler)
+        return cls(experts, clusterer, clustering_scaler, payload['omegaBasedNets'])
 
     # save()/load() are fully inherited from _wrapper — no override needed.
 

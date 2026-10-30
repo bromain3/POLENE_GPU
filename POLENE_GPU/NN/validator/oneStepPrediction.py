@@ -8,7 +8,7 @@ from POLENE_GPU.NN.models.mixtureOfExperts import MixtureOfExperts
 
 
 class oneStepPredictionValidator(_commonValidator):
-    def validate(self, model, X, Y, tX, showClusters: bool = False):
+    def validate(self, model, X, Y, tX, showClusters: bool = False, plotError: bool = False):
         self._checkInput(model, X, Y)
 
         model.eval()
@@ -32,6 +32,8 @@ class oneStepPredictionValidator(_commonValidator):
                 cmap = cm.get_cmap("tab10", n_clusters)
                 cluster_colors = [cmap(k) for k in range(n_clusters)]
 
+        eps = 1e-30
+
         for col in X.colName:
             fig, axs = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
 
@@ -39,34 +41,60 @@ class oneStepPredictionValidator(_commonValidator):
             pred   = preds[col].cpu().detach().numpy()
             target = Y[col].cpu().detach().numpy()
 
-            # =========================
-            # Plot linéaire
-            # =========================
-            if use_clusters:
-                _plot_colored_segments(axs[0], t, pred, labels, cluster_colors, linestyle='--')
+            if plotError:
+                # =========================
+                # Erreur : linéaire (signée) et log (valeur absolue)
+                # =========================
+                err = np.abs(pred - target)
+
+                # --- Linéaire ---
+                if use_clusters:
+                    _plot_colored_segments(axs[0], t, err, labels, cluster_colors, linestyle='-')
+                else:
+                    axs[0].plot(t, err, label='error (pred - target)', color='red')
+                axs[0].axhline(0.0, color='black', linewidth=0.8)
+                axs[0].set_title(f"{col} - error (linear scale)")
+                axs[0].legend()
+                axs[0].grid(True)
+
+                # --- Log ---
+                abs_err = np.abs(err) + eps
+                if use_clusters:
+                    _plot_colored_segments(axs[1], t, abs_err, labels, cluster_colors,
+                                           linestyle='-', log=True)
+                else:
+                    axs[1].semilogy(t, abs_err, label='|error|', color='red')
+                axs[1].set_title(f"{col} - |error| (log scale)")
+                axs[1].legend()
+                axs[1].grid(True)
+
             else:
-                axs[0].plot(t, pred, label='prediction', color='red', linestyle='--')
+                # =========================
+                # Plot linéaire
+                # =========================
+                if use_clusters:
+                    _plot_colored_segments(axs[0], t, pred, labels, cluster_colors, linestyle='--')
+                else:
+                    axs[0].plot(t, pred, label='prediction', color='red', linestyle='--')
 
-            axs[0].plot(t, target, label='target', color='blue')
-            axs[0].set_title(f"{col} (linear scale)")
-            axs[0].legend()
-            axs[0].grid(True)
+                axs[0].plot(t, target, label='target', color='blue')
+                axs[0].set_title(f"{col} (linear scale)")
+                axs[0].legend()
+                axs[0].grid(True)
 
-            # =========================
-            # Plot logarithmique
-            # =========================
-            eps = 1e-30
+                # =========================
+                # Plot logarithmique
+                # =========================
+                if use_clusters:
+                    _plot_colored_segments(axs[1], t, np.abs(pred) + eps, labels, cluster_colors,
+                                           linestyle='--', log=True)
+                else:
+                    axs[1].semilogy(t, np.abs(pred) + eps, label='prediction', color='red', linestyle='--')
 
-            if use_clusters:
-                _plot_colored_segments(axs[1], t, np.abs(pred) + eps, labels, cluster_colors,
-                                       linestyle='--', log=True)
-            else:
-                axs[1].semilogy(t, np.abs(pred) + eps, label='prediction', color='red', linestyle='--')
-
-            axs[1].semilogy(t, np.abs(target) + eps, label='target', color='blue')
-            axs[1].set_title(f"{col} (log scale)")
-            axs[1].legend()
-            axs[1].grid(True)
+                axs[1].semilogy(t, np.abs(target) + eps, label='target', color='blue')
+                axs[1].set_title(f"{col} (log scale)")
+                axs[1].legend()
+                axs[1].grid(True)
 
             axs[1].set_xlabel("t")
 

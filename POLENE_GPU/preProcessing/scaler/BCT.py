@@ -33,6 +33,7 @@ class boxCoxScaler(_BaseTransform):
         self._dtype = x.storingDtype
 
     def _syncTorch(self, x):
+        # .to() est un no-op (pas de copie, pas de sync) si le masque est déjà sur le bon device
         self._species_mask = self._species_mask.to(x.device)
         self._device = x.device
         self._dtype = x.dtype
@@ -41,36 +42,40 @@ class boxCoxScaler(_BaseTransform):
         return torch.tensor(self.threshold, device=device, dtype=dtype)
 
     def _clip(self, data):
-        t = self._threshold_tensor(data.device, data.dtype)
-        out = data.clone()
-        out[:, self._species_mask] = torch.where(
-            data[:, self._species_mask] <= t,
-            t,
-            data[:, self._species_mask],
+        # Version sans indexation par masque booléen (pas de nonzero -> pas de sync GPU)
+        return torch.where(
+            self._species_mask,
+            torch.clamp(data, min=self.threshold),
+            data,
         )
-        return out
 
 
 ############################################
     #TODO: try to understand the impact of the threshold and of the clamping on grandient propagation and on autoregressive use
+    # Les deux fonctions ci-dessous n'utilisent AUCUNE indexation par masque booléen
+    # (data[:, mask] / out[:, mask] = ... déclenchent un nonzero => synchronisation CPU<->GPU)
+    # et aucune création de tenseur à chaque appel (le seuil est un scalaire Python).
+    #
+    # Double torch.where : les colonnes non-espèces (T, P, ...) sont remplacées par 1.0
+    # AVANT le pow, pour que la branche non sélectionnée ne produise jamais d'inf/NaN
+    # (sinon 0 * inf = NaN dans le gradient, p.ex. (lam*P + 1)**10 déborde en float32).
     def _forward(self, data):
-        out = data.clone()
-        t = self._threshold_tensor(data.device, data.dtype)
         lam = self.lambda_
+        mask = self._species_mask  # (F,), broadcast sur (N, F)
 
-        col = data[:, self._species_mask]
-        safe_col = torch.where(col > t, col, t)  # jamais <= 0 si threshold > 0
-        out[:, self._species_mask] = (safe_col.pow(lam) - 1.0) / lam
-        return out
+        col = torch.where(mask, data, torch.ones_like(data))
+        safe_col = torch.clamp(col, min=self.threshold)  # jamais <= 0 si threshold > 0
+        bct = (safe_col.pow(lam) - 1.0) / lam
+        return torch.where(mask, bct, data)
 
     def _backward(self, data):
-        out = data.clone()
         lam = self.lambda_
-        col = data[:, self._species_mask]
-        base = lam * col + 1.0
-        base = torch.clamp(base, min=1e-30)  # évite pow() sur base négative/nulle #TODO: saise une erreur ou warning si on clamp réellement, ça veut dire qu'on sort du domaine de la trasformation box cox
-        out[:, self._species_mask] = base.pow(1.0 / lam)
-        return out
+        mask = self._species_mask
+
+        base = lam * data + 1.0
+        base = torch.where(mask, base, torch.ones_like(base))
+        base = torch.clamp(base, min=self.threshold)  # évite pow() sur base négative/nulle #TODO: saise une erreur ou warning si on clamp réellement, ça veut dire qu'on sort du domaine de la trasformation box cox
+        return torch.where(mask, base.pow(1.0 / lam), data)
 #########################################
 
 
